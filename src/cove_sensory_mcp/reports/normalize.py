@@ -152,28 +152,9 @@ def _has_running_loop() -> bool:
     return True
 
 
-def _discard_awaitable(result: Awaitable[str]) -> None:
-    if isinstance(result, asyncio.Future):
-        result.cancel()
-        return
-    if inspect.iscoroutine(result):
-        result.close()
-        return
-    cancel = getattr(result, "cancel", None)
-    if callable(cancel):
-        cancel()
-        return
-    close = getattr(result, "close", None)
-    if callable(close):
-        close()
-
-
 def _invoke_repair(repair: RepairCallback, text: str) -> str:
     result = repair(text)
     if inspect.isawaitable(result):
-        if _has_running_loop():
-            _discard_awaitable(result)
-            raise _InvalidProviderResponse
         return asyncio.run(_await_repair(result))
     if not isinstance(result, str):
         raise _InvalidProviderResponse
@@ -208,7 +189,7 @@ def normalize_provider_text(
     duration_seconds: float | None,
     repair: RepairCallback | None = None,
 ) -> ProviderObservationBatch:
-    """Parse, bound, and validate one provider response with at most one repair."""
+    """Normalize synchronously; active-loop callers needing repair must use async."""
     _validate_normalize_arguments(expected_modalities, duration_seconds)
     try:
         return _normalize_once(
@@ -219,6 +200,8 @@ def normalize_provider_text(
     except _InvalidProviderResponse:
         pass
     if repair is None:
+        raise _public_error()
+    if _has_running_loop():
         raise _public_error()
     try:
         repaired_text = _invoke_repair(repair, text)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from collections.abc import Callable
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
@@ -386,19 +388,9 @@ async def test_async_entry_awaits_loop_bound_repair_without_orphaning_task() -> 
 
 
 @pytest.mark.asyncio
-async def test_sync_entry_in_active_loop_cancels_loop_bound_repair_task() -> None:
-    raw = "private loop-bound repair body"
-    blocker = asyncio.Event()
-    created: list[asyncio.Task[str]] = []
-
-    async def wait_forever() -> str:
-        await blocker.wait()
-        return _payload(_envelope())
-
-    def repair(_: str) -> asyncio.Task[str]:
-        task = asyncio.create_task(wait_forever())
-        created.append(task)
-        return task
+async def test_sync_entry_in_active_loop_does_not_invoke_coroutine_function() -> None:
+    raw = "private coroutine repair body"
+    repair = AsyncMock(return_value=_payload(_envelope()))
 
     with pytest.raises(SensoryError) as caught:
         normalize_provider_text(
@@ -407,13 +399,99 @@ async def test_sync_entry_in_active_loop_cancels_loop_bound_repair_task() -> Non
             duration_seconds=30,
             repair=repair,
         )
-    await asyncio.sleep(0)
 
+    assert repair.call_count == 0
     assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
     assert raw not in str(caught.value)
     assert caught.value.__context__ is None
-    assert len(created) == 1
-    assert created[0].cancelled()
+
+
+@pytest.mark.asyncio
+async def test_sync_entry_in_active_loop_does_not_invoke_task_callback() -> None:
+    calls = 0
+
+    def repair(_: str) -> asyncio.Task[str]:
+        nonlocal calls
+        calls += 1
+        return asyncio.create_task(asyncio.sleep(0, result=_payload(_envelope())))
+
+    with pytest.raises(SensoryError) as caught:
+        normalize_provider_text(
+            "invalid original body",
+            expected_modalities=frozenset({Modality.VIDEO_VISUAL}),
+            duration_seconds=30,
+            repair=repair,
+        )
+
+    assert calls == 0
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+
+
+@pytest.mark.asyncio
+async def test_sync_entry_does_not_leak_private_failure_to_loop_handler() -> None:
+    private = "private cancellation-resistant failure"
+    loop = asyncio.get_running_loop()
+    captured_contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    calls = 0
+    created: list[asyncio.Future[str]] = []
+
+    class CancellationResistantFuture(asyncio.Future[str]):
+        def cancel(self, msg: object = None) -> bool:
+            return False
+
+    def repair(_: str) -> asyncio.Future[str]:
+        nonlocal calls
+        calls += 1
+        future = CancellationResistantFuture()
+        created.append(future)
+        loop.call_soon(future.set_exception, RuntimeError(private))
+        return future
+
+    def capture_context(_: asyncio.AbstractEventLoop, context: dict[str, object]) -> None:
+        captured_contexts.append(context)
+
+    loop.set_exception_handler(capture_context)
+    try:
+        with pytest.raises(SensoryError) as caught:
+            normalize_provider_text(
+                "invalid original body",
+                expected_modalities=frozenset({Modality.VIDEO_VISUAL}),
+                duration_seconds=30,
+                repair=repair,
+            )
+        await asyncio.sleep(0)
+        created.clear()
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert calls == 0
+    assert captured_contexts == []
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert private not in str(caught.value)
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_sync_entry_in_active_loop_keeps_valid_input_success() -> None:
+    calls = 0
+
+    def repair(_: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _payload(_envelope())
+
+    batch = normalize_provider_text(
+        _payload(_envelope()),
+        expected_modalities=frozenset({Modality.VIDEO_VISUAL}),
+        duration_seconds=30,
+        repair=repair,
+    )
+
+    assert batch.observations[0].modality is Modality.VIDEO_VISUAL
+    assert calls == 0
 
 
 @pytest.mark.asyncio

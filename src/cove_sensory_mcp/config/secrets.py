@@ -71,16 +71,16 @@ class KeyringSecretStore:
             _validate_secret(secret)
             return secret
         try:
-            secret = keyring.get_password(_KEYRING_SERVICE_NAME, ref)
+            stored_secret = keyring.get_password(_KEYRING_SERVICE_NAME, ref)
         except Exception as exc:
             raise SensoryError(
                 ErrorCode.SETUP_REQUIRED,
                 _KEYRING_UNAVAILABLE_MESSAGE,
             ) from exc
-        if secret is None:
+        if stored_secret is None:
             raise _missing_secret_error()
-        _validate_secret(secret)
-        return secret
+        _validate_secret(stored_secret)
+        return stored_secret
 
 
 class MemorySecretStore:

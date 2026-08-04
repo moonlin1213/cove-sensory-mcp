@@ -8,7 +8,6 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from pydantic import ValidationError
@@ -26,6 +25,7 @@ _TIMECODE_WARNING = {
     "code": "TIMECODE_OUT_OF_RANGE",
     "message": "One or more timecoded items were omitted because they fell outside the media range.",
 }
+_MAX_WARNINGS = 200
 
 
 class _InvalidProviderResponse(Exception):
@@ -42,16 +42,13 @@ def _extract_json(text: str) -> str:
     return match.group(1) if match is not None else stripped
 
 
-def _normalized_timestamp(value: object) -> float | None:
-    if isinstance(value, bool):
+def _raw_finite_timestamp(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        timestamp = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
+    timestamp = float(value)
     if not math.isfinite(timestamp):
         return None
-    return round(timestamp, 3)
+    return timestamp
 
 
 def _normalize_timecoded_items(
@@ -67,20 +64,29 @@ def _normalize_timecoded_items(
         if not isinstance(item, Mapping):
             normalized.append(item)
             continue
-        start = _normalized_timestamp(item.get("start_seconds"))
-        end = _normalized_timestamp(item.get("end_seconds"))
+        if "start_seconds" not in item or "end_seconds" not in item:
+            normalized.append(item)
+            continue
+        start = _raw_finite_timestamp(item["start_seconds"])
+        end = _raw_finite_timestamp(item["end_seconds"])
+        if start is None or end is None:
+            normalized.append(item)
+            continue
         if (
-            start is None
-            or end is None
-            or start < 0
-            or end < start
+            start < 0
+            or start >= end
             or (duration_seconds is not None and end > duration_seconds)
         ):
             removed += 1
             continue
+        rounded_start = round(start, 3)
+        rounded_end = round(end, 3)
+        if rounded_start >= rounded_end:
+            removed += 1
+            continue
         normalized_item = dict(item)
-        normalized_item["start_seconds"] = start
-        normalized_item["end_seconds"] = end
+        normalized_item["start_seconds"] = rounded_start
+        normalized_item["end_seconds"] = rounded_end
         normalized.append(normalized_item)
     return normalized, removed
 
@@ -107,8 +113,10 @@ def _normalize_timecodes(value: object, duration_seconds: float | None) -> objec
         normalized_observation["segments"] = segments
         normalized_observation["transcript"] = transcript
         if removed_segments or removed_transcript:
-            warnings = observation.get("warnings")
+            warnings = observation.get("warnings", [])
             if isinstance(warnings, list):
+                if len(warnings) == _MAX_WARNINGS:
+                    warnings = warnings[: _MAX_WARNINGS - 1]
                 normalized_observation["warnings"] = [*warnings, _TIMECODE_WARNING]
         normalized_observations.append(normalized_observation)
     normalized_value["observations"] = normalized_observations
@@ -136,26 +144,62 @@ async def _await_repair(result: Awaitable[str]) -> str:
     return await result
 
 
-def _run_awaitable(result: Awaitable[str]) -> str:
+def _has_running_loop() -> bool:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_await_repair(result))
+        return False
+    return True
 
-    def run_in_fresh_loop() -> str:
-        return asyncio.run(_await_repair(result))
 
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sensory-repair") as executor:
-        return executor.submit(run_in_fresh_loop).result()
+def _discard_awaitable(result: Awaitable[str]) -> None:
+    if isinstance(result, asyncio.Future):
+        result.cancel()
+        return
+    if inspect.iscoroutine(result):
+        result.close()
+        return
+    cancel = getattr(result, "cancel", None)
+    if callable(cancel):
+        cancel()
+        return
+    close = getattr(result, "close", None)
+    if callable(close):
+        close()
 
 
 def _invoke_repair(repair: RepairCallback, text: str) -> str:
     result = repair(text)
     if inspect.isawaitable(result):
-        return _run_awaitable(result)
+        if _has_running_loop():
+            _discard_awaitable(result)
+            raise _InvalidProviderResponse
+        return asyncio.run(_await_repair(result))
     if not isinstance(result, str):
         raise _InvalidProviderResponse
     return result
+
+
+async def _invoke_repair_async(repair: RepairCallback, text: str) -> str:
+    result = repair(text)
+    if inspect.isawaitable(result):
+        return await result
+    if not isinstance(result, str):
+        raise _InvalidProviderResponse
+    return result
+
+
+def _validate_normalize_arguments(
+    expected_modalities: frozenset[Modality], duration_seconds: float | None
+) -> None:
+    if not expected_modalities or len(expected_modalities) > len(Modality):
+        raise ValueError("expected_modalities must contain one to five modalities")
+    if duration_seconds is not None and (
+        isinstance(duration_seconds, bool)
+        or not math.isfinite(duration_seconds)
+        or duration_seconds < 0
+    ):
+        raise ValueError("duration_seconds must be a finite non-negative number")
 
 
 def normalize_provider_text(
@@ -165,14 +209,7 @@ def normalize_provider_text(
     repair: RepairCallback | None = None,
 ) -> ProviderObservationBatch:
     """Parse, bound, and validate one provider response with at most one repair."""
-    if not expected_modalities or len(expected_modalities) > len(Modality):
-        raise ValueError("expected_modalities must contain one to five modalities")
-    if duration_seconds is not None and (
-        isinstance(duration_seconds, bool)
-        or not math.isfinite(duration_seconds)
-        or duration_seconds < 0
-    ):
-        raise ValueError("duration_seconds must be a finite non-negative number")
+    _validate_normalize_arguments(expected_modalities, duration_seconds)
     try:
         return _normalize_once(
             text,
@@ -185,6 +222,36 @@ def normalize_provider_text(
         raise _public_error()
     try:
         repaired_text = _invoke_repair(repair, text)
+        return _normalize_once(
+            repaired_text,
+            expected_modalities=expected_modalities,
+            duration_seconds=duration_seconds,
+        )
+    except Exception:  # noqa: BLE001, S110 - privacy boundary intentionally discards internals
+        pass
+    raise _public_error()
+
+
+async def normalize_provider_text_async(
+    text: str,
+    expected_modalities: frozenset[Modality],
+    duration_seconds: float | None,
+    repair: RepairCallback | None = None,
+) -> ProviderObservationBatch:
+    """Normalize provider text while awaiting repair on the caller's event loop."""
+    _validate_normalize_arguments(expected_modalities, duration_seconds)
+    try:
+        return _normalize_once(
+            text,
+            expected_modalities=expected_modalities,
+            duration_seconds=duration_seconds,
+        )
+    except _InvalidProviderResponse:
+        pass
+    if repair is None:
+        raise _public_error()
+    try:
+        repaired_text = await _invoke_repair_async(repair, text)
         return _normalize_once(
             repaired_text,
             expected_modalities=expected_modalities,

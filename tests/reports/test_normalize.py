@@ -9,7 +9,10 @@ from pydantic import ValidationError
 
 from cove_sensory_mcp.errors import ErrorCode, SensoryError, error_result
 from cove_sensory_mcp.models import Modality
-from cove_sensory_mcp.reports.normalize import normalize_provider_text
+from cove_sensory_mcp.reports.normalize import (
+    normalize_provider_text,
+    normalize_provider_text_async,
+)
 from cove_sensory_mcp.reports.schemas import (
     ObservationEnvelope,
     ObservationSegment,
@@ -135,6 +138,91 @@ def test_negative_timestamp_item_is_removed_with_warning() -> None:
     envelope = batch.by_modality()[Modality.VIDEO_VISUAL]
     assert [item.text for item in envelope.transcript] == ["valid"]
     assert [warning.code for warning in envelope.warnings] == ["TIMECODE_OUT_OF_RANGE"]
+
+
+@pytest.mark.parametrize(
+    "invalid_segment",
+    [
+        {"start_seconds": -0.0004, "end_seconds": 1, "text": "negative"},
+        {"start_seconds": 1.0004, "end_seconds": 1.0003, "text": "reversed"},
+        {"start_seconds": 1, "end_seconds": 1, "text": "empty"},
+        {"start_seconds": 29, "end_seconds": 30.0004, "text": "past-duration"},
+    ],
+    ids=["tiny-negative", "reversed-before-rounding", "equal", "tiny-past-duration"],
+)
+def test_raw_semantic_timestamp_errors_cannot_be_hidden_by_rounding(
+    invalid_segment: dict[str, object],
+) -> None:
+    batch = _normalize(
+        _payload(
+            _envelope(
+                segments=[
+                    invalid_segment,
+                    {"start_seconds": 2, "end_seconds": 3, "text": "valid"},
+                ]
+            )
+        )
+    )
+
+    envelope = batch.by_modality()[Modality.VIDEO_VISUAL]
+    assert [segment.text for segment in envelope.segments] == ["valid"]
+    assert [warning.code for warning in envelope.warnings] == ["TIMECODE_OUT_OF_RANGE"]
+
+
+@pytest.mark.parametrize(
+    "invalid_segment",
+    [
+        {"end_seconds": 1, "text": "missing"},
+        {"start_seconds": False, "end_seconds": 1, "text": "boolean"},
+        {"start_seconds": "not-a-number", "end_seconds": 1, "text": "nonnumeric"},
+    ],
+    ids=["missing", "boolean", "nonnumeric"],
+)
+def test_structurally_invalid_timestamp_uses_repair_path(
+    invalid_segment: dict[str, object],
+) -> None:
+    calls: list[str] = []
+
+    def repair(text: str) -> str:
+        calls.append(text)
+        return _payload(_envelope())
+
+    invalid_text = _payload(_envelope(segments=[invalid_segment]))
+    batch = _normalize(invalid_text, repair=repair)
+
+    assert calls == [invalid_text]
+    assert batch.observations[0].segments == []
+
+
+def test_removed_segment_adds_warning_when_provider_omits_warnings() -> None:
+    observation = _envelope(
+        segments=[{"start_seconds": 31, "end_seconds": 32, "text": "invalid"}]
+    )
+    del observation["warnings"]
+
+    batch = _normalize(_payload(observation))
+
+    assert [warning.code for warning in batch.observations[0].warnings] == [
+        "TIMECODE_OUT_OF_RANGE"
+    ]
+
+
+def test_generated_warning_reserves_capacity_in_a_full_warning_list() -> None:
+    warnings = [{"code": f"W{index}", "message": "provider warning"} for index in range(200)]
+    batch = _normalize(
+        _payload(
+            _envelope(
+                segments=[{"start_seconds": 31, "end_seconds": 32, "text": "invalid"}],
+                warnings=warnings,
+            )
+        )
+    )
+
+    normalized_warnings = batch.observations[0].warnings
+    assert len(normalized_warnings) == 200
+    assert normalized_warnings[0].code == "W0"
+    assert normalized_warnings[-2].code == "W198"
+    assert normalized_warnings[-1].code == "TIMECODE_OUT_OF_RANGE"
 
 
 def test_overlapping_valid_segments_are_preserved() -> None:
@@ -269,6 +357,87 @@ def test_async_repair_is_invoked_once_after_initial_failure() -> None:
 
     assert batch.observations[0].modality is Modality.VIDEO_VISUAL
     assert calls == ["invalid original body"]
+
+
+@pytest.mark.asyncio
+async def test_async_entry_awaits_loop_bound_repair_without_orphaning_task() -> None:
+    loop = asyncio.get_running_loop()
+    result: asyncio.Future[str] = loop.create_future()
+
+    async def produce_result() -> None:
+        await asyncio.sleep(0)
+        result.set_result(_payload(_envelope()))
+
+    producer = loop.create_task(produce_result())
+
+    def repair(_: str) -> asyncio.Future[str]:
+        return result
+
+    batch = await normalize_provider_text_async(
+        "invalid original body",
+        expected_modalities=frozenset({Modality.VIDEO_VISUAL}),
+        duration_seconds=30,
+        repair=repair,
+    )
+
+    assert batch.observations[0].modality is Modality.VIDEO_VISUAL
+    assert producer.done()
+    assert result.done()
+
+
+@pytest.mark.asyncio
+async def test_sync_entry_in_active_loop_cancels_loop_bound_repair_task() -> None:
+    raw = "private loop-bound repair body"
+    blocker = asyncio.Event()
+    created: list[asyncio.Task[str]] = []
+
+    async def wait_forever() -> str:
+        await blocker.wait()
+        return _payload(_envelope())
+
+    def repair(_: str) -> asyncio.Task[str]:
+        task = asyncio.create_task(wait_forever())
+        created.append(task)
+        return task
+
+    with pytest.raises(SensoryError) as caught:
+        normalize_provider_text(
+            raw,
+            expected_modalities=frozenset({Modality.VIDEO_VISUAL}),
+            duration_seconds=30,
+            repair=repair,
+        )
+    await asyncio.sleep(0)
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert raw not in str(caught.value)
+    assert caught.value.__context__ is None
+    assert len(created) == 1
+    assert created[0].cancelled()
+
+
+@pytest.mark.asyncio
+async def test_async_entry_hides_loop_bound_repair_failure() -> None:
+    raw = "private async repair failure"
+    loop = asyncio.get_running_loop()
+    failed: asyncio.Future[str] = loop.create_future()
+    failed.set_exception(RuntimeError(raw))
+
+    def repair(_: str) -> asyncio.Future[str]:
+        return failed
+
+    with pytest.raises(SensoryError) as caught:
+        await normalize_provider_text_async(
+            "invalid original body",
+            expected_modalities=frozenset({Modality.VIDEO_VISUAL}),
+            duration_seconds=30,
+            repair=repair,
+        )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert raw not in str(caught.value)
+    assert caught.value.cause is None
+    assert caught.value.__context__ is None
 
 
 def test_repair_failure_is_not_retried_or_exposed() -> None:

@@ -21,7 +21,7 @@ def _round_timestamp(value: float) -> float:
 
 Timestamp = Annotated[
     float,
-    Field(ge=0, allow_inf_nan=False),
+    Field(strict=True, ge=0, allow_inf_nan=False),
     AfterValidator(_round_timestamp),
 ]
 
@@ -38,8 +38,8 @@ class ObservationSegment(BaseModel):
     @model_validator(mode="after")
     def validate_time_range(self) -> ObservationSegment:
         """Reject reversed ranges while allowing adjacent and overlapping evidence."""
-        if self.end_seconds < self.start_seconds:
-            raise ValueError("end_seconds must not precede start_seconds")
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must follow start_seconds")
         return self
 
 
@@ -55,8 +55,8 @@ class TranscriptSegment(BaseModel):
     @model_validator(mode="after")
     def validate_time_range(self) -> TranscriptSegment:
         """Reject reversed transcript ranges without forbidding overlap."""
-        if self.end_seconds < self.start_seconds:
-            raise ValueError("end_seconds must not precede start_seconds")
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must follow start_seconds")
         return self
 
 

@@ -674,6 +674,7 @@ def test_known_adapter_options_remain_portable(tmp_path: Path) -> None:
             "request_timeout_seconds": 30.0,
             "media_part_mode": "video_url_data_uri",
             "endpoint_path": "/v1/responses",
+            "extra_headers_env": {"X-Tenant-Token": "COVE_TENANT_TOKEN"},
         },
     )
     expected = AppConfig(providers={"custom": provider})

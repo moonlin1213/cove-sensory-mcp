@@ -41,6 +41,29 @@ _CREDENTIAL_PARAMETER_NAMES = frozenset(
     }
 )
 _ENVIRONMENT_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}\Z")
+_MAX_EXTRA_HEADERS = 16
+_FORBIDDEN_EXTRA_HEADERS = frozenset(
+    {
+        "authorization",
+        "connection",
+        "content-encoding",
+        "content-length",
+        "content-type",
+        "cookie",
+        "expect",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 _MAX_CAPABILITIES = len(Modality)
 _MAX_JOINT_CAPABILITIES = 26
 CapabilityMap = Annotated[
@@ -67,9 +90,38 @@ _ADAPTER_OPTION_NAMES = frozenset(
         "request_timeout_seconds",
         "endpoint_path",
         "media_part_mode",
+        "extra_headers_env",
     }
 )
 _INVALID_ADAPTER_OPTIONS_MESSAGE = "Adapter options contain an unsupported field."
+_INVALID_EXTRA_HEADERS_MESSAGE = "Adapter header environment references are invalid."
+
+
+def _private_adapter_validation_error(
+    title: str,
+    error_type: str,
+    message: str,
+) -> ValidationError:
+    """Build one input-free adapter validation error safe for nested diagnostics."""
+    return ValidationError.from_exception_data(
+        title,
+        [
+            InitErrorDetails(
+                type=PydanticCustomError(error_type, message),
+                loc=(),
+                input=None,
+            )
+        ],
+        hide_input=True,
+    )
+
+
+def _invalid_extra_headers_error(title: str) -> ValidationError:
+    return _private_adapter_validation_error(
+        title,
+        "adapter_extra_headers_invalid",
+        _INVALID_EXTRA_HEADERS_MESSAGE,
+    )
 
 
 def _contains_credential_parameter(component: str) -> bool:
@@ -139,28 +191,44 @@ class AdapterOptions(BaseModel):
         "video_url_data_uri",
         "anthropic_base64_media",
     ] | None = None
+    extra_headers_env: Annotated[
+        dict[StrictStr, StrictStr],
+        Field(max_length=_MAX_EXTRA_HEADERS),
+    ] | None = None
 
     @model_validator(mode="before")
     @classmethod
     def reject_unknown_options(cls, value: object) -> object:
         """Reject unknown keys without placing attacker-controlled data in errors."""
-        if isinstance(value, Mapping) and any(
-            key not in _ADAPTER_OPTION_NAMES for key in value
-        ):
-            raise ValidationError.from_exception_data(
-                cls.__name__,
-                [
-                    InitErrorDetails(
-                        type=PydanticCustomError(
-                            "adapter_options_invalid",
-                            _INVALID_ADAPTER_OPTIONS_MESSAGE,
-                        ),
-                        loc=(),
-                        input=None,
-                    )
-                ],
-                hide_input=True,
-            )
+        if isinstance(value, Mapping):
+            if any(key not in _ADAPTER_OPTION_NAMES for key in value):
+                raise _private_adapter_validation_error(
+                    cls.__name__,
+                    "adapter_options_invalid",
+                    _INVALID_ADAPTER_OPTIONS_MESSAGE,
+                )
+            extra_headers = value.get("extra_headers_env")
+            if extra_headers is not None:
+                if not isinstance(extra_headers, Mapping) or len(
+                    extra_headers
+                ) > _MAX_EXTRA_HEADERS:
+                    raise _invalid_extra_headers_error(cls.__name__)
+                normalized_names: set[str] = set()
+                for header_name, environment_name in extra_headers.items():
+                    if not isinstance(header_name, str) or not isinstance(
+                        environment_name, str
+                    ):
+                        raise _invalid_extra_headers_error(cls.__name__)
+                    normalized_name = header_name.lower()
+                    if (
+                        _HTTP_HEADER_NAME.fullmatch(header_name) is None
+                        or normalized_name in _FORBIDDEN_EXTRA_HEADERS
+                        or normalized_name in normalized_names
+                        or _ENVIRONMENT_VARIABLE_NAME.fullmatch(environment_name)
+                        is None
+                    ):
+                        raise _invalid_extra_headers_error(cls.__name__)
+                    normalized_names.add(normalized_name)
         return value
 
     @field_validator("endpoint_path")

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import cast
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig, RoutesConfig
+from cove_sensory_mcp.config.store import ConfigStore
 from cove_sensory_mcp.errors import ErrorCode, SensoryError
 from cove_sensory_mcp.models import Modality, ProviderRef, RouteConfig
 from cove_sensory_mcp.providers.base import SensoryProvider
@@ -199,6 +202,23 @@ def test_joint_candidate_is_not_manufactured(config: AppConfig) -> None:
     assert ProviderRouter(config).joint_candidate(modalities) is None
 
 
+def test_split_primary_joint_route_returns_none_before_verification() -> None:
+    """Verifying split routes first could raise instead of declining a joint route."""
+    modalities = frozenset({Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO})
+    config = AppConfig(
+        providers={
+            "verified-eye": _provider(Modality.VIDEO_VISUAL),
+            "unverified-ear": _provider(),
+        },
+        routes=RoutesConfig(
+            video_visual=RouteConfig(primary="verified-eye"),
+            video_audio=RouteConfig(primary="unverified-ear"),
+        ),
+    )
+
+    assert ProviderRouter(config).joint_candidate(modalities) is None
+
+
 def test_registry_returns_only_the_injected_adapter() -> None:
     """Reading global state in get() could replace the adapter injected by the caller."""
     injected = cast(SensoryProvider, object())
@@ -252,6 +272,168 @@ def test_provider_capability_configuration_is_bounded(
             credential_ref="test-credential",
             **provider_kwargs,
         )
+
+
+@pytest.mark.parametrize(
+    ("adapter_options", "private_fragment"),
+    [
+        pytest.param({"api_key": "plaintext-secret"}, "plaintext-secret", id="api-key"),
+        pytest.param(
+            {"api-key": "plaintext-secret"},
+            "plaintext-secret",
+            id="punctuation-alias",
+        ),
+        pytest.param(
+            {"Authorization": "Bearer private-token"},
+            "private-token",
+            id="authorization",
+        ),
+        pytest.param(
+            {"headers": {"Authorization": "Bearer private-token"}},
+            "private-token",
+            id="headers-map",
+        ),
+        pytest.param(
+            {"nested": {"safe_name": "private-nested-value"}},
+            "private-nested-value",
+            id="nested-map",
+        ),
+        pytest.param(
+            {"base_url": "https://private-endpoint.test"},
+            "private-endpoint.test",
+            id="base-url-shadow",
+        ),
+        pytest.param(
+            {"url": "https://private-endpoint.test"},
+            "private-endpoint.test",
+            id="url-shadow",
+        ),
+        pytest.param(
+            {"endpoint": "https://private-endpoint.test"},
+            "private-endpoint.test",
+            id="endpoint-shadow",
+        ),
+        pytest.param(
+            {"api_key_env": "PRIVATE_API_KEY"},
+            "PRIVATE_API_KEY",
+            id="api-key-env-shadow",
+        ),
+        pytest.param(
+            {"credential_ref": "private-credential-ref"},
+            "private-credential-ref",
+            id="credential-ref-shadow",
+        ),
+        pytest.param(
+            {"keyring_service": "private-keyring-service"},
+            "private-keyring-service",
+            id="keyring-shadow",
+        ),
+        pytest.param(
+            {"accessToken": "private-access-token"},
+            "private-access-token",
+            id="camel-case-token",
+        ),
+        pytest.param(
+            {"secret-source": "private-secret-source"},
+            "private-secret-source",
+            id="secret-source",
+        ),
+        pytest.param(
+            {"bearer": "private-bearer-token"},
+            "private-bearer-token",
+            id="bearer-alias",
+        ),
+        pytest.param(
+            {"private_key": "private-signing-key"},
+            "private-signing-key",
+            id="private-key-alias",
+        ),
+        pytest.param(
+            {"base_uri": "https://private-endpoint.test"},
+            "private-endpoint.test",
+            id="base-uri-shadow",
+        ),
+        pytest.param(
+            {"environment_variable": "PRIVATE_API_KEY"},
+            "PRIVATE_API_KEY",
+            id="environment-variable-source",
+        ),
+        pytest.param(
+            {"proxy": "https://private-proxy.test"},
+            "private-proxy.test",
+            id="proxy-endpoint-shadow",
+        ),
+    ],
+)
+def test_config_store_rejects_unsafe_adapter_options_without_echo(
+    tmp_path: Path,
+    adapter_options: dict[str, object],
+    private_fragment: str,
+) -> None:
+    """Allowing secret or endpoint shadows could persist credentials in local YAML."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "providers": {
+                    "custom": {
+                        "adapter": "openai-compatible",
+                        "model": "test-model",
+                        "credential_ref": "safe-reference",
+                        "adapter_options": adapter_options,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SensoryError) as exc_info:
+        ConfigStore(path).load()
+
+    assert exc_info.value.code is ErrorCode.CONFIG_INVALID
+    assert str(exc_info.value) == "The configuration file is invalid."
+    assert private_fragment not in str(exc_info.value)
+
+
+def test_unsafe_adapter_option_validation_hides_private_input() -> None:
+    """Pydantic diagnostics must not echo a rejected plaintext option value."""
+    private = "private-plaintext-credential"
+
+    with pytest.raises(ValidationError) as exc_info:
+        ProviderConfig(
+            adapter="openai-compatible",
+            model="test-model",
+            credential_ref="safe-reference",
+            adapter_options={"api-key": private},
+        )
+
+    assert private not in str(exc_info.value)
+
+
+def test_safe_scalar_and_list_adapter_options_remain_portable(tmp_path: Path) -> None:
+    """Overbroad credential filtering must not reject bounded non-secret tuning options."""
+    path = tmp_path / "config.yaml"
+    provider = ProviderConfig(
+        adapter="openai-compatible",
+        model="test-model",
+        credential_ref="safe-reference",
+        adapter_options={
+            "max_output_tokens": 4_096,
+            "temperature": 0.2,
+            "retry_status_codes": [429, 503],
+            "feature_flags": [True, False],
+            "media_part_mode": "video_url_data_uri",
+            "endpoint_path": "/v1/responses",
+        },
+    )
+    expected = AppConfig(providers={"custom": provider})
+
+    ConfigStore(path).save(expected)
+
+    assert ConfigStore(path).load() == expected
+    assert "!!python" not in path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(

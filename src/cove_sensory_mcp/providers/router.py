@@ -88,19 +88,19 @@ class ProviderRouter:
         if len(modalities) < 2:
             return None
 
-        routes: list[RouteConfig] = []
-        providers: list[ProviderConfig] = []
+        routes: list[tuple[Modality, RouteConfig]] = []
         for modality in sorted(modalities, key=lambda item: item.value):
             route = self._route(modality)
             if route is None:
                 return None
-            routes.append(route)
-            providers.append(self._verified_provider(route.primary, modality))
+            routes.append((modality, route))
 
-        primary = routes[0].primary
-        if any(route.primary != primary for route in routes[1:]):
+        primary = routes[0][1].primary
+        if any(route.primary != primary for _, route in routes[1:]):
             return None
-        provider = providers[0]
+        provider = self._verified_provider(primary, routes[0][0])
+        for modality, _ in routes[1:]:
+            self._verified_provider(primary, modality)
         if modalities not in provider.verified_joint_capabilities:
             return None
         return ProviderCandidate(provider_id=primary, modalities=modalities)

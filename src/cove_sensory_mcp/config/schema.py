@@ -9,6 +9,7 @@ from typing import Annotated, Literal, TypeAlias
 from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -42,10 +43,95 @@ _MAX_JOINT_CAPABILITIES = 26
 _MAX_ADAPTER_OPTIONS = 32
 _MAX_ADAPTER_OPTION_ITEMS = 32
 _MAX_ADAPTER_OPTION_STRING = 2_048
+_ADAPTER_OPTION_KEY_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_RESERVED_ADAPTER_OPTION_KEYS = frozenset(
+    {
+        "apikey",
+        "apikeyenv",
+        "auth",
+        "authorization",
+        "authorizationheader",
+        "authorizationheaders",
+        "authheader",
+        "authheaders",
+        "baseurl",
+        "baseuri",
+        "bearer",
+        "credential",
+        "credentialref",
+        "endpoint",
+        "env",
+        "environment",
+        "environmentvariable",
+        "envsource",
+        "header",
+        "headers",
+        "key",
+        "keyring",
+        "password",
+        "passwd",
+        "proxy",
+        "secret",
+        "token",
+        "url",
+    }
+)
+# Generic storage only proves a key/value is non-secret and bounded. Adapters that use
+# known options such as endpoint_path or media_part_mode must validate their semantics.
+_SAFE_ENDPOINT_OPTION_KEYS = frozenset({"endpointpath"})
+
+
+def _normalize_config_name(value: str) -> str:
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def _validate_adapter_option_key(value: str) -> str:
+    """Reject generic options that could shadow credentials or remote endpoints."""
+    if _ADAPTER_OPTION_KEY_PATTERN.fullmatch(value) is None:
+        raise ValueError("adapter option key is invalid")
+    normalized = _normalize_config_name(value)
+    if (
+        normalized in _RESERVED_ADAPTER_OPTION_KEYS
+        or "apikey" in normalized
+        or "authorization" in normalized
+        or "credential" in normalized
+        or "headers" in normalized
+        or "keyring" in normalized
+        or "password" in normalized
+        or "passwd" in normalized
+        or "secret" in normalized
+        or normalized.endswith(
+            ("token", "key", "env", "environment", "envvar", "url", "uri")
+        )
+        or "baseurl" in normalized
+        or "environmentvariable" in normalized
+        or (
+            "endpoint" in normalized
+            and normalized not in _SAFE_ENDPOINT_OPTION_KEYS
+        )
+        or normalized.startswith(
+            (
+                "authentication",
+                "authheader",
+                "authkey",
+                "authref",
+                "authsource",
+                "authtoken",
+                "oauth",
+                "proxy",
+                "tokenenv",
+                "tokenfile",
+                "tokenref",
+                "tokensource",
+            )
+        )
+    ):
+        raise ValueError("adapter option key is reserved")
+    return value
 
 AdapterOptionKey = Annotated[
     str,
-    Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$"),
+    AfterValidator(_validate_adapter_option_key),
 ]
 AdapterOptionString = Annotated[str, Field(max_length=_MAX_ADAPTER_OPTION_STRING)]
 AdapterOptionInteger = Annotated[
@@ -63,13 +149,7 @@ AdapterOptionList = Annotated[
     list[AdapterOptionScalar],
     Field(max_length=_MAX_ADAPTER_OPTION_ITEMS),
 ]
-AdapterOptionMap = Annotated[
-    dict[AdapterOptionKey, AdapterOptionScalar],
-    Field(max_length=_MAX_ADAPTER_OPTION_ITEMS),
-]
-AdapterOptionValue: TypeAlias = (
-    AdapterOptionScalar | AdapterOptionList | AdapterOptionMap
-)
+AdapterOptionValue: TypeAlias = AdapterOptionScalar | AdapterOptionList
 CapabilityMap = Annotated[
     dict[Modality, StrictBool],
     Field(max_length=_MAX_CAPABILITIES),
@@ -149,6 +229,23 @@ class ProviderConfig(BaseModel):
         """Keep explicit environment references portable and bounded."""
         if value is not None and _ENVIRONMENT_VARIABLE_NAME.fullmatch(value) is None:
             raise ValueError("api_key_env must be a portable environment variable name")
+        return value
+
+    @field_validator("adapter_options", mode="before")
+    @classmethod
+    def validate_adapter_option_structure(cls, value: object) -> object:
+        """Reject reserved keys and nested mappings before private input can surface."""
+        if not isinstance(value, dict):
+            return value
+        for key, option in value.items():
+            try:
+                _validate_adapter_option_key(key)
+            except (TypeError, ValueError):
+                raise ValueError("adapter option key is invalid") from None
+            if isinstance(option, dict):
+                raise ValueError(  # noqa: TRY004 - Pydantic validation contract
+                    "nested adapter option mappings are not allowed"
+                )
         return value
 
     @field_validator("base_url")

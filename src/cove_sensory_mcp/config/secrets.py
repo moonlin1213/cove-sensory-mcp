@@ -30,6 +30,9 @@ class SecretStore(Protocol):
     def get(self, ref: str, env_name: str | None = None) -> str:
         """Return an environment override or the secret stored for ``ref``."""
 
+    def delete(self, ref: str) -> None:
+        """Delete one validated secret reference during a failed config transaction."""
+
 
 def _validate_ref(ref: str) -> None:
     """Reject references that could be blank or span multiple backend entries."""
@@ -82,6 +85,17 @@ class KeyringSecretStore:
         _validate_secret(stored_secret)
         return stored_secret
 
+    def delete(self, ref: str) -> None:
+        """Delete a credential created by a configuration transaction."""
+        _validate_ref(ref)
+        try:
+            keyring.delete_password(_KEYRING_SERVICE_NAME, ref)
+        except Exception as exc:
+            raise SensoryError(
+                ErrorCode.SETUP_REQUIRED,
+                _KEYRING_UNAVAILABLE_MESSAGE,
+            ) from exc
+
 
 class MemorySecretStore:
     """Test-only in-memory implementation of :class:`SecretStore`."""
@@ -108,6 +122,11 @@ class MemorySecretStore:
             raise _missing_secret_error() from exc
         _validate_secret(secret)
         return secret
+
+    def delete(self, ref: str) -> None:
+        """Delete one test credential without affecting other references."""
+        _validate_ref(ref)
+        self.values.pop(ref, None)
 
 
 def redact_text(value: str, secrets: Iterable[str]) -> str:

@@ -22,6 +22,10 @@ class FakeKeyring:
         """Store a fake credential without any operating-system side effect."""
         self.values[(service_name, username)] = password
 
+    def delete_password(self, service_name: str, username: str) -> None:
+        """Delete a fake credential without any operating-system side effect."""
+        del self.values[(service_name, username)]
+
 
 @pytest.fixture
 def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> FakeKeyring:
@@ -29,4 +33,5 @@ def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> FakeKeyring:
     store = FakeKeyring()
     monkeypatch.setattr(keyring, "get_password", store.get_password)
     monkeypatch.setattr(keyring, "set_password", store.set_password)
+    monkeypatch.setattr(keyring, "delete_password", store.delete_password)
     return store

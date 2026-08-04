@@ -82,6 +82,30 @@ def test_keyring_store_uses_project_service_name(fake_keyring: Any) -> None:
     assert store.get("gemini-main") == secret
 
 
+def test_secret_store_delete_removes_only_the_requested_reference(fake_keyring: Any) -> None:
+    """Deleting a different key during config rollback would destroy unrelated credentials."""
+    store = KeyringSecretStore()
+    store.set("gemini-main", "gemini-secret-value")
+    store.set("minimax-main", "minimax-secret-value")
+
+    store.delete("gemini-main")
+
+    assert fake_keyring.values == {
+        ("cove-sensory-mcp", "minimax-main"): "minimax-secret-value"
+    }
+
+
+def test_memory_secret_store_delete_removes_only_the_requested_reference() -> None:
+    """A test backend that cannot model rollback would leave the CLI behavior untested."""
+    store = MemorySecretStore()
+    store.set("gemini-main", "gemini-secret-value")
+    store.set("minimax-main", "minimax-secret-value")
+
+    store.delete("gemini-main")
+
+    assert store.values == {"minimax-main": "minimax-secret-value"}
+
+
 def test_keyring_backend_failure_has_public_environment_setup_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

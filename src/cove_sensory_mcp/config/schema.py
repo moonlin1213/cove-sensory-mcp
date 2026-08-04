@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cove_sensory_mcp.models import RouteConfig
+from cove_sensory_mcp.models import Modality, RouteConfig
 
 _CREDENTIAL_PARAMETER_NAMES = frozenset(
     {
@@ -47,6 +47,7 @@ class ProviderConfig(BaseModel):
     model: str = Field(min_length=1)
     credential_ref: str | None = Field(default=None, min_length=1)
     api_key_env: str | None = Field(default=None, min_length=1)
+    declared_capabilities: dict[Modality, bool] = Field(default_factory=dict)
 
     @field_validator("base_url")
     @classmethod

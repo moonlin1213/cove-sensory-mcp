@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+from mcp import Client
 
 from cove_sensory_mcp.config.secrets import MemorySecretStore
 from cove_sensory_mcp.config.store import ConfigStore
@@ -66,6 +67,49 @@ async def test_setup_tools_expose_only_explicit_public_inputs(services: AppServi
             "type": "array",
         }
     }
+
+
+@pytest.mark.parametrize(
+    ("invalid_modality", "private_fragment"),
+    [
+        ("sk-review-secret-123456789", "review-secret"),
+        (r"C:\Users\private-review\secret.txt", "private-review"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_self_test_modalities_return_only_a_bounded_public_error(
+    services: AppServices,
+    invalid_modality: str,
+    private_fragment: str,
+) -> None:
+    """SDK argument validation must not reflect credentials, paths, or raw internals."""
+    async with Client(create_server(services), mode="legacy") as client:
+        result = await client.call_tool(
+            "sensory_self_test",
+            {"modalities": [invalid_modality]},
+        )
+
+    assert result.is_error is True
+    assert result.structured_content == {
+        "status": "error",
+        "error": {
+            "code": "CONFIG_INVALID",
+            "message": "The tool arguments are invalid.",
+            "retryable": False,
+        },
+    }
+    public_wire = result.model_dump_json(by_alias=True)
+    assert len(public_wire) < 800
+    assert private_fragment not in public_wire
+    for raw_detail in (
+        "validation error",
+        "self_test_toolArguments",
+        "literal_error",
+        "input_value",
+        "pydantic.dev",
+        "ValidationError",
+    ):
+        assert raw_detail not in public_wire
 
 
 def test_serve_stdout_contains_only_mcp_json(tmp_path) -> None:

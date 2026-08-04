@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
-from typing import Literal
+from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer as FastMCP
-from mcp.types import ToolAnnotations
+from mcp.server.mcpserver.context import Context
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult, InputRequiredResult, TextContent, ToolAnnotations
 
+from cove_sensory_mcp.errors import ErrorCode, SensoryError, error_result
 from cove_sensory_mcp.models import Modality
 from cove_sensory_mcp.services import AppServices
 from cove_sensory_mcp.tools.setup import (
@@ -34,11 +38,36 @@ _GUIDE_DESCRIPTION = (
 _SELF_TEST_DESCRIPTION = (
     "Inspect local configuration readiness; read-only setup tools never accept credentials."
 )
+_INVALID_ARGUMENTS_MESSAGE = "The tool arguments are invalid."
+
+
+def _invalid_arguments_result() -> CallToolResult:
+    payload = error_result(SensoryError(ErrorCode.CONFIG_INVALID, _INVALID_ARGUMENTS_MESSAGE))
+    return CallToolResult(
+        content=[TextContent(text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))],
+        structured_content=payload,
+        is_error=True,
+    )
+
+
+class _PrivacySafeFastMCP(FastMCP[None]):
+    """Translate SDK tool failures before their raw details reach an MCP client."""
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context[None, Any] | None = None,
+    ) -> CallToolResult | InputRequiredResult:
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError:
+            return _invalid_arguments_result()
 
 
 def create_server(services: AppServices) -> FastMCP[None]:
     """Bind the foundation setup handlers to the official Python MCP server."""
-    server: FastMCP[None] = FastMCP("cove-sensory-mcp")
+    server: FastMCP[None] = _PrivacySafeFastMCP("cove-sensory-mcp")
 
     @server.tool(
         name="sensory_status",

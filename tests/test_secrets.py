@@ -103,6 +103,34 @@ def test_keyring_backend_failure_has_public_environment_setup_error(
     assert "gemini-main" not in public_message
     assert "keyring-secret-value" not in public_message
     assert "backend details" not in public_message
+    assert caught.value.cause is None
+    assert caught.value.__cause__ is backend_error
+    assert "keyring-secret-value" not in captured.out
+    assert "keyring-secret-value" not in captured.err
+
+
+def test_keyring_write_failure_retains_backend_error_only_as_chained_cause(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Storing the raw backend error on the public exception would make it serializable."""
+    backend_error = RuntimeError("write backend details with keyring-secret-value")
+
+    def fail_set_password(service_name: str, username: str, password: str) -> None:
+        raise backend_error
+
+    monkeypatch.setattr(keyring, "set_password", fail_set_password)
+
+    with pytest.raises(SensoryError) as caught:
+        KeyringSecretStore().set("gemini-main", "keyring-secret-value")
+
+    public_message = str(caught.value)
+    captured = capsys.readouterr()
+    assert caught.value.code is ErrorCode.SETUP_REQUIRED
+    assert "environment variable" in public_message.lower()
+    assert "gemini-main" not in public_message
+    assert "keyring-secret-value" not in public_message
+    assert "write backend details" not in public_message
+    assert caught.value.cause is None
     assert caught.value.__cause__ is backend_error
     assert "keyring-secret-value" not in captured.out
     assert "keyring-secret-value" not in captured.err

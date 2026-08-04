@@ -61,7 +61,6 @@ class KeyringSecretStore:
             raise SensoryError(
                 ErrorCode.SETUP_REQUIRED,
                 _KEYRING_UNAVAILABLE_MESSAGE,
-                cause=exc,
             ) from exc
 
     def get(self, ref: str, env_name: str | None = None) -> str:
@@ -77,7 +76,6 @@ class KeyringSecretStore:
             raise SensoryError(
                 ErrorCode.SETUP_REQUIRED,
                 _KEYRING_UNAVAILABLE_MESSAGE,
-                cause=exc,
             ) from exc
         if secret is None:
             raise _missing_secret_error()

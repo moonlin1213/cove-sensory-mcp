@@ -34,6 +34,17 @@ def test_disabled_capability_cannot_be_verified() -> None:
         )
 
 
+def test_verified_capability_cannot_have_a_reason() -> None:
+    """Removing the verified/reason guard would publish contradictory capability state."""
+    with pytest.raises(ValidationError, match="cannot have a reason"):
+        CapabilityStatus(
+            modality=Modality.IMAGE,
+            enabled=True,
+            verified=True,
+            reason="Private provider detail must not accompany a verified capability",
+        )
+
+
 def test_disabled_capability_requires_a_nonempty_reason() -> None:
     with pytest.raises(ValidationError, match="requires a reason"):
         CapabilityStatus(
@@ -83,6 +94,22 @@ def test_status_serializes_capabilities_by_modality() -> None:
             }
         },
     }
+
+
+def test_status_rejects_capability_key_and_modality_mismatch() -> None:
+    """Removing key consistency validation would mislabel a capability in public status."""
+    with pytest.raises(ValidationError, match="key must match"):
+        SensoryStatus(
+            ready=True,
+            version="1.0.0",
+            capabilities={
+                Modality.AUDIO: CapabilityStatus(
+                    modality=Modality.IMAGE,
+                    enabled=True,
+                    verified=True,
+                )
+            },
+        )
 
 
 def test_route_fallback_keeps_its_explicit_authorization() -> None:

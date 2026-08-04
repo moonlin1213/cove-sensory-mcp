@@ -247,10 +247,6 @@ def run_configure(
         output(f"Credential: environment variable {state} (name and value are hidden).")
     else:
         output("Credential: stored locally (value and reference are hidden).")
-    try:
-        _clean_answer(input_fn, "Configure another provider later? [y/N]: ")
-    except (EOFError, KeyboardInterrupt, StopIteration, _ConfigurationCancelled):
-        pass
     return 0
 
 

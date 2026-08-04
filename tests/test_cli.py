@@ -112,6 +112,29 @@ def test_configure_saves_reference_but_not_secret(
     )
 
 
+def test_configure_stops_prompting_after_one_provider_is_saved(
+    tmp_services: AppServices,
+) -> None:
+    """Restoring the discarded post-save question would imply an unsupported provider loop."""
+    answers = iter(["gemini", "gemini-main", "gemini-test-model"])
+    prompts: list[str] = []
+
+    def answer(prompt: str) -> str:
+        prompts.append(prompt)
+        try:
+            return next(answers)
+        except StopIteration:
+            pytest.fail("configure asked an extra question after saving one provider")
+
+    assert run_configure(
+        tmp_services,
+        input_fn=answer,
+        secret_input_fn=lambda _: "test-secret-that-stays-local",
+        output=lambda _: None,
+    ) == 0
+    assert all("another provider" not in prompt.lower() for prompt in prompts)
+
+
 def test_configure_explains_capabilities_and_privacy_before_accepting_key(
     tmp_services: AppServices,
 ) -> None:

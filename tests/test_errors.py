@@ -45,6 +45,7 @@ def test_error_string_returns_only_public_message() -> None:
 def test_error_code_members_match_the_public_contract() -> None:
     assert [code.value for code in ErrorCode] == [
         "SETUP_REQUIRED",
+        "CONFIG_INVALID",
         "CAPABILITY_NOT_CONFIGURED",
         "CAPABILITY_NOT_VERIFIED",
         "PATH_NOT_ALLOWED",

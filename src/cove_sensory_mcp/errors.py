@@ -9,6 +9,7 @@ class ErrorCode(str, Enum):
     """Stable, machine-readable error codes exposed by the MCP server."""
 
     SETUP_REQUIRED = "SETUP_REQUIRED"
+    CONFIG_INVALID = "CONFIG_INVALID"
     CAPABILITY_NOT_CONFIGURED = "CAPABILITY_NOT_CONFIGURED"
     CAPABILITY_NOT_VERIFIED = "CAPABILITY_NOT_VERIFIED"
     PATH_NOT_ALLOWED = "PATH_NOT_ALLOWED"

@@ -1247,6 +1247,70 @@ async def test_streaming_response_is_closed_when_call_is_cancelled(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
+    ("http_status", "want_code", "want_retryable"),
+    [
+        pytest.param(
+            200,
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            False,
+            id="deep-success-envelope",
+        ),
+        pytest.param(
+            500,
+            ErrorCode.PROVIDER_UNAVAILABLE,
+            True,
+            id="deep-error-envelope",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_deeply_nested_bounded_json_cannot_escape_raw_recursion_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    http_status: int,
+    want_code: ErrorCode,
+    want_retryable: bool,
+) -> None:
+    """A byte-bounded body must also contain JSON decoder recursion failures."""
+    image = tmp_path / "deep-json.jpg"
+    image.write_bytes(b"image")
+    private_marker = "private-deep-json-body-marker"
+    depth = 10_000
+    body = (
+        b'{"nested":'
+        + b"[" * depth
+        + json.dumps(private_marker).encode("utf-8")
+        + b"]" * depth
+        + b"}"
+    )
+    stream = TrackingAsyncStream([body])
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(
+        lambda request: httpx.Response(http_status, stream=stream)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is want_code
+    assert caught.value.retryable is want_retryable
+    assert caught.value.cause is None
+    public_text = str(caught.value)
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    for private_value in (private_marker, "RecursionError", "maximum recursion"):
+        assert private_value not in public_text
+        assert private_value not in log_text
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
     ("response", "want_code"),
     [
         pytest.param(httpx.Response(200, content=b""), ErrorCode.PROVIDER_CAPABILITY_REJECTED, id="empty"),

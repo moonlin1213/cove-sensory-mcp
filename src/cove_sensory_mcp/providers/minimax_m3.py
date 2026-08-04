@@ -166,7 +166,7 @@ def _classify_response(
 def _decode_response_payload(body: bytes) -> dict[str, Any] | None:
     try:
         payload: Any = json.loads(body)
-    except (UnicodeDecodeError, ValueError):
+    except (RecursionError, UnicodeDecodeError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
 

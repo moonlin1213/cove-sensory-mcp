@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from enum import Enum
 from typing import Any
 
@@ -29,7 +30,10 @@ _DEFAULT_TEMPERATURE = 0.2
 _DEFAULT_TIMEOUT_SECONDS = 120.0
 _MAX_MODEL_LENGTH = 256
 _MAX_TEMPERATURE = 1.0
-_MAX_ERROR_INSPECTION_BYTES = 65_536
+_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_MAX_CONTENT_BLOCKS = 64
+_MAX_TEXT_BLOCK_CHARS = 2_000_000
+_MAX_COMBINED_TEXT_CHARS = 2_000_000
 
 _CONFIG_MESSAGE = "The MiniMax provider settings are invalid."
 _AUTH_MESSAGE = "The provider credential was rejected."
@@ -95,88 +99,149 @@ def _response_error() -> SensoryError:
     return SensoryError(ErrorCode.PROVIDER_CAPABILITY_REJECTED, _RESPONSE_MESSAGE)
 
 
-def _bounded_body_text(response: httpx.Response) -> str:
-    return response.content[:_MAX_ERROR_INSPECTION_BYTES].decode(
-        "utf-8",
-        errors="replace",
-    ).lower()
+class _MalformedEnvelope(Exception):
+    """Internal marker that deliberately retains no response data."""
 
 
-def _classify_response(response: httpx.Response) -> _FailureKind:
-    if response.status_code in {401, 403}:
-        return _FailureKind.AUTH
-    if response.status_code == 429:
-        return _FailureKind.RATE_LIMIT
-    if response.status_code in {408, 504}:
-        return _FailureKind.TIMEOUT
-    if response.status_code == 415:
-        return _FailureKind.UNSUPPORTED_MEDIA
+class _ResponseReadRejected(Exception):
+    """Internal marker for invalid or oversized streamed response bytes."""
 
-    body = _bounded_body_text(response)
-    if any(
-        marker in body
-        for marker in (
-            "safety_error",
-            "safety policy",
-            "content_filter",
-            "content policy",
-            "unsafe media",
-            "prohibited_content",
-        )
-    ):
-        return _FailureKind.SAFETY
-    if any(
-        marker in body
-        for marker in (
-            "unsupported_media",
-            "unsupported media",
-            "media format unsupported",
+
+def _structured_error_kind(payload: dict[str, Any]) -> _FailureKind | None:
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    error_code = error.get("code", error.get("type"))
+    if isinstance(error_code, str):
+        normalized_code = error_code.strip().lower()
+        if normalized_code in {
             "invalid_media_type",
-        )
-    ):
+            "unsupported_media",
+            "unsupported_media_type",
+        }:
+            return _FailureKind.UNSUPPORTED_MEDIA
+        if normalized_code in {
+            "content_filter",
+            "prohibited_content",
+            "safety_error",
+        }:
+            return _FailureKind.SAFETY
+    message = error.get("message")
+    if isinstance(message, str):
+        normalized_message = message.strip().lower()
+        if normalized_message in {
+            "invalid media type",
+            "unsupported media",
+            "unsupported media type",
+        }:
+            return _FailureKind.UNSUPPORTED_MEDIA
+        if normalized_message in {
+            "content policy",
+            "safety policy",
+            "unsafe media",
+        }:
+            return _FailureKind.SAFETY
+    return None
+
+
+def _classify_response(
+    status_code: int,
+    payload: dict[str, Any] | None,
+) -> _FailureKind:
+    if status_code in {401, 403}:
+        return _FailureKind.AUTH
+    if status_code == 429:
+        return _FailureKind.RATE_LIMIT
+    if status_code in {408, 504}:
+        return _FailureKind.TIMEOUT
+    if status_code == 415:
         return _FailureKind.UNSUPPORTED_MEDIA
-    if response.status_code in {400, 404, 405, 406, 409, 410, 413, 422}:
-        return _FailureKind.UNSUPPORTED_MEDIA
+    if payload is not None:
+        structured_kind = _structured_error_kind(payload)
+        if structured_kind is not None:
+            return structured_kind
     return _FailureKind.UNAVAILABLE
 
 
-def _extract_response_text(response: httpx.Response) -> str:
+def _decode_response_payload(body: bytes) -> dict[str, Any] | None:
     try:
-        payload: Any = response.json()
-    except ValueError:
-        raise _response_error() from None
-    if not isinstance(payload, dict):
-        raise _response_error()
+        payload: Any = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _declared_content_length(response: httpx.Response) -> int | None:
+    raw_length = response.headers.get("content-length")
+    if raw_length is None:
+        return None
+    if not raw_length.isascii() or not raw_length.isdigit():
+        raise _ResponseReadRejected
+    content_length = int(raw_length)
+    if content_length > _MAX_RESPONSE_BYTES:
+        raise _ResponseReadRejected
+    return content_length
+
+
+async def _read_bounded_response(response: httpx.Response) -> bytes:
+    _declared_content_length(response)
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(chunk) > _MAX_RESPONSE_BYTES - len(body):
+            raise _ResponseReadRejected
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _base_response_code(payload: dict[str, Any]) -> int | None:
+    if "base_resp" not in payload:
+        return None
+    base_response = payload["base_resp"]
+    if not isinstance(base_response, dict):
+        raise _MalformedEnvelope
+    code = base_response.get("status_code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise _MalformedEnvelope
+    return code
+
+
+def _base_response_failure(code: int) -> _FailureKind | None:
+    if code == 0:
+        return None
+    if code == 1001:
+        return _FailureKind.TIMEOUT
+    if code == 1002:
+        return _FailureKind.RATE_LIMIT
+    if code in {1004, 2049}:
+        return _FailureKind.AUTH
+    if code in {1026, 1027}:
+        return _FailureKind.SAFETY
+    return _FailureKind.UNAVAILABLE
+
+
+def _extract_response_text(payload: dict[str, Any]) -> str:
     content = payload.get("content")
-    if not isinstance(content, list):
+    if not isinstance(content, list) or len(content) > _MAX_CONTENT_BLOCKS:
         raise _response_error()
     text_parts: list[str] = []
+    combined_length = 0
     for part in content:
         if not isinstance(part, dict) or part.get("type") != "text":
             continue
         text = part.get("text")
-        if isinstance(text, str) and text.strip():
+        if not isinstance(text, str):
+            raise _response_error()
+        if len(text) > _MAX_TEXT_BLOCK_CHARS:
+            raise _response_error()
+        separator_length = 1 if combined_length else 0
+        if len(text) + separator_length > _MAX_COMBINED_TEXT_CHARS - combined_length:
+            raise _response_error()
+        combined_length += separator_length + len(text)
+        if text.strip():
             text_parts.append(text)
     if not text_parts:
         raise _response_error()
     return "\n".join(text_parts)
-
-
-def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
-    return url.scheme, url.host, url.port
-
-
-def _is_cross_origin_redirect(response: httpx.Response) -> bool:
-    if not response.is_redirect:
-        return False
-    location = response.headers.get("location")
-    if not location or response.request is None:
-        return True
-    try:
-        destination = response.request.url.join(location)
-    except (TypeError, ValueError):
-        return True
-    return _origin(destination) != _origin(response.request.url)
 
 
 def _media_type(request: ProviderRequest) -> str | None:
@@ -348,14 +413,31 @@ class MiniMaxM3Provider:
         credential = self._credential()
         headers = self._headers(credential)
         credential = ""
+        response_status: int | None = None
+        response_success = False
+        response_body = b""
         try:
-            response = await self._client.post(
+            async with self._client.stream(
+                "POST",
                 self._endpoint,
                 headers=headers,
                 json=payload,
                 timeout=self._timeout(),
-            )
+                follow_redirects=False,
+            ) as response:
+                response_status = response.status_code
+                response_success = response.is_success
+                if response.is_redirect:
+                    raise _public_error(_FailureKind.UNAVAILABLE)
+                try:
+                    response_body = await _read_bounded_response(response)
+                except _ResponseReadRejected:
+                    if response_success:
+                        raise _response_error() from None
+                    raise _public_error(_FailureKind.UNAVAILABLE) from None
         except asyncio.CancelledError:
+            raise
+        except SensoryError:
             raise
         except httpx.TimeoutException:
             raise _public_error(_FailureKind.TIMEOUT) from None
@@ -368,14 +450,30 @@ class MiniMaxM3Provider:
             payload.clear()
             prompt = ""
 
-        if response.is_redirect:
-            if _is_cross_origin_redirect(response):
-                raise _public_error(_FailureKind.UNAVAILABLE)
+        if response_status is None:
             raise _public_error(_FailureKind.UNAVAILABLE)
-        if not response.is_success:
-            raise _public_error(_classify_response(response))
+        response_payload = _decode_response_payload(response_body)
+        response_body = b""
+        if response_payload is None:
+            if response_success:
+                raise _response_error()
+            raise _public_error(_FailureKind.UNAVAILABLE)
+        try:
+            base_code = _base_response_code(response_payload)
+        except _MalformedEnvelope:
+            if response_success:
+                raise _response_error() from None
+            raise _public_error(_FailureKind.UNAVAILABLE) from None
+        if base_code is not None:
+            base_failure = _base_response_failure(base_code)
+            if base_failure is not None:
+                raise _public_error(base_failure)
+        elif response_success:
+            raise _response_error()
+        if not response_success:
+            raise _public_error(_classify_response(response_status, response_payload))
 
-        response_text = _extract_response_text(response)
+        response_text = _extract_response_text(response_payload)
         batch = normalize_provider_text(
             response_text,
             expected_modalities=request.requested_modalities,

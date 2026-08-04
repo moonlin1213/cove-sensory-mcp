@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,6 +26,10 @@ from cove_sensory_mcp.providers.minimax_m3 import (
 )
 
 _SECRET = "test-minimax-secret-that-must-stay-private"
+_MAX_RESPONSE_BYTES_TEST = 8 * 1024 * 1024
+_MAX_CONTENT_BLOCKS_TEST = 64
+_MAX_TEXT_BLOCK_CHARS_TEST = 2_000_000
+_MAX_COMBINED_TEXT_CHARS_TEST = 2_000_000
 
 
 def _observation(modality: Modality, *, summary: str = "Direct evidence.") -> dict[str, object]:
@@ -55,7 +59,58 @@ def _provider_response(modality: Modality, *, summary: str = "Direct evidence.")
         "model": "MiniMax-M3",
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 12, "output_tokens": 18},
+        "base_resp": {"status_code": 0, "status_msg": "success"},
     }
+
+
+def _response_with_base_code(
+    modality: Modality,
+    status_code: object,
+    *,
+    status_msg: str = "private-provider-status-marker",
+) -> dict[str, object]:
+    payload = _provider_response(modality)
+    payload["base_resp"] = {
+        "status_code": status_code,
+        "status_msg": status_msg,
+    }
+    return payload
+
+
+class TrackingAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.yielded_chunks = 0
+        self.iterated = False
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.iterated = True
+        for chunk in self._chunks:
+            self.yielded_chunks += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class BlockingAsyncStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.started.set()
+        await self.gate.wait()
+        yield b"unreachable-after-cancel"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _response_bytes(modality: Modality = Modality.IMAGE) -> bytes:
+    return json.dumps(_provider_response(modality)).encode("utf-8")
 
 
 def _config(
@@ -119,8 +174,15 @@ def _store() -> MemorySecretStore:
     return store
 
 
-def _client(handler: Callable[[httpx.Request], object]) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(cast(Any, handler)))
+def _client(
+    handler: Callable[[httpx.Request], object],
+    *,
+    follow_redirects: bool = False,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(cast(Any, handler)),
+        follow_redirects=follow_redirects,
+    )
 
 
 def _provider(
@@ -645,10 +707,11 @@ def test_adapter_rejects_values_outside_its_low_variance_bounds(
             httpx.Response(
                 400,
                 json={
+                    "type": "error",
                     "error": {
-                        "code": "unsupported_media_type",
-                        "message": "video media format unsupported",
-                    }
+                        "type": "unsupported_media_type",
+                        "message": "unsupported media type",
+                    },
                 },
             ),
             ErrorCode.PROVIDER_CAPABILITY_REJECTED,
@@ -690,6 +753,497 @@ async def test_http_failures_map_to_stable_sanitized_categories(
     assert caught.value.retryable is want_retryable
     assert caught.value.cause is None
     assert raw_body not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("http_status", "base_code", "want_code", "want_retryable"),
+    [
+        pytest.param(200, 1001, ErrorCode.PROVIDER_TIMEOUT, True, id="timeout-1001"),
+        pytest.param(
+            200,
+            1002,
+            ErrorCode.PROVIDER_UNAVAILABLE,
+            True,
+            id="rate-limit-1002",
+        ),
+        pytest.param(
+            503,
+            1004,
+            ErrorCode.PROVIDER_AUTH_FAILED,
+            False,
+            id="auth-1004-non-2xx",
+        ),
+        pytest.param(
+            200,
+            2049,
+            ErrorCode.PROVIDER_AUTH_FAILED,
+            False,
+            id="auth-2049",
+        ),
+        pytest.param(
+            200,
+            1026,
+            ErrorCode.PROVIDER_SAFETY_REJECTED,
+            False,
+            id="input-safety-1026",
+        ),
+        pytest.param(
+            400,
+            1027,
+            ErrorCode.PROVIDER_SAFETY_REJECTED,
+            False,
+            id="output-safety-1027-non-2xx",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_base_response_codes_override_http_status_without_leaking_status_message(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    http_status: int,
+    base_code: int,
+    want_code: ErrorCode,
+    want_retryable: bool,
+) -> None:
+    """Ignoring MiniMax's structured status would misclassify a valid HTTP envelope."""
+    image = tmp_path / "base-code.jpg"
+    image.write_bytes(b"image")
+    private_status = f"private-status-{base_code}-{_SECRET}"
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(
+        lambda request: httpx.Response(
+            http_status,
+            json=_response_with_base_code(
+                Modality.IMAGE,
+                base_code,
+                status_msg=private_status,
+            ),
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is want_code
+    assert caught.value.retryable is want_retryable
+    assert caught.value.cause is None
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert private_status not in str(caught.value)
+    assert private_status not in log_text
+
+
+@pytest.mark.parametrize("http_status", [200, 400])
+@pytest.mark.asyncio
+async def test_unknown_nonzero_base_code_is_never_guessed_as_unsupported_media(
+    tmp_path: Path,
+    http_status: int,
+) -> None:
+    """An undocumented status must remain unavailable even if its message suggests media."""
+    image = tmp_path / "unknown-base-code.jpg"
+    image.write_bytes(b"image")
+
+    async with _client(
+        lambda request: httpx.Response(
+            http_status,
+            json=_response_with_base_code(
+                Modality.IMAGE,
+                9999,
+                status_msg="unsupported media private body marker",
+            ),
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_UNAVAILABLE
+    assert caught.value.retryable is True
+    assert "unsupported media" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("http_status", "base_resp", "want_code", "want_retryable"),
+    [
+        pytest.param(
+            200,
+            {"status_code": "1004", "status_msg": "invalid API key private"},
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            False,
+            id="string-code-success",
+        ),
+        pytest.param(
+            400,
+            {"status_code": "1026", "status_msg": "unsafe media private"},
+            ErrorCode.PROVIDER_UNAVAILABLE,
+            True,
+            id="string-code-error",
+        ),
+        pytest.param(
+            200,
+            {"status_code": True, "status_msg": "boolean private"},
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            False,
+            id="boolean-code",
+        ),
+        pytest.param(
+            200,
+            {"status_msg": "missing code private"},
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            False,
+            id="missing-code",
+        ),
+        pytest.param(
+            200,
+            "not-an-object",
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            False,
+            id="non-object-base-response",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_base_response_fails_without_guessing_from_private_message(
+    tmp_path: Path,
+    http_status: int,
+    base_resp: object,
+    want_code: ErrorCode,
+    want_retryable: bool,
+) -> None:
+    """Coercing a malformed status code could turn arbitrary text into an error category."""
+    image = tmp_path / "malformed-base-response.jpg"
+    image.write_bytes(b"image")
+    payload = _provider_response(Modality.IMAGE)
+    payload["base_resp"] = base_resp
+
+    async with _client(
+        lambda request: httpx.Response(http_status, json=payload)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is want_code
+    assert caught.value.retryable is want_retryable
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_streamed_response_without_content_length_is_bounded_and_closed(
+    tmp_path: Path,
+) -> None:
+    """Chunked success responses must use the same bounded parser and release transport."""
+    image = tmp_path / "chunked-success.jpg"
+    image.write_bytes(b"image")
+    body = _response_bytes()
+    stream = TrackingAsyncStream([body[:17], body[17:]])
+
+    async with _client(
+        lambda request: httpx.Response(200, stream=stream)
+    ) as client:
+        result = await _provider(client).sense(
+            _request(
+                image,
+                media_kind=MediaKind.IMAGE,
+                mime_type="image/jpeg",
+                modalities=frozenset({Modality.IMAGE}),
+            )
+        )
+
+    assert result.observations[Modality.IMAGE].summary == "Direct evidence."
+    assert stream.yielded_chunks == 2
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize("content_length", ["invalid", "-1", "1, 2"])
+@pytest.mark.asyncio
+async def test_invalid_content_length_is_rejected_before_stream_iteration(
+    tmp_path: Path,
+    content_length: str,
+) -> None:
+    """Trusting a malformed length would disable the response precheck."""
+    image = tmp_path / "invalid-length.jpg"
+    image.write_bytes(b"image")
+    stream = TrackingAsyncStream([_response_bytes()])
+
+    async with _client(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-length": content_length},
+            stream=stream,
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert stream.iterated is False
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_oversized_content_length_closes_without_reading_body(tmp_path: Path) -> None:
+    """A declared oversized response must be refused before downloading any chunk."""
+    image = tmp_path / "declared-oversized.jpg"
+    image.write_bytes(b"image")
+    stream = TrackingAsyncStream([b"private-body-marker"])
+
+    async with _client(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-length": str(_MAX_RESPONSE_BYTES_TEST + 1)},
+            stream=stream,
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert "private-body-marker" not in str(caught.value)
+    assert stream.iterated is False
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("http_status", "want_code", "want_retryable"),
+    [
+        pytest.param(
+            200,
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            False,
+            id="oversized-success",
+        ),
+        pytest.param(
+            503,
+            ErrorCode.PROVIDER_UNAVAILABLE,
+            True,
+            id="oversized-error",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_chunked_response_stops_at_cumulative_byte_cap_and_closes(
+    tmp_path: Path,
+    http_status: int,
+    want_code: ErrorCode,
+    want_retryable: bool,
+) -> None:
+    """Reading past the cumulative cap would permit chunked response amplification."""
+    image = tmp_path / "chunk-overflow.jpg"
+    image.write_bytes(b"image")
+    half = _MAX_RESPONSE_BYTES_TEST // 2
+    stream = TrackingAsyncStream(
+        [
+            b"a" * half,
+            b"b" * (half + 1),
+            b"private-third-chunk-must-not-be-read",
+        ]
+    )
+
+    async with _client(
+        lambda request: httpx.Response(http_status, stream=stream)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is want_code
+    assert caught.value.retryable is want_retryable
+    assert "private-third-chunk" not in str(caught.value)
+    assert stream.yielded_chunks == 2
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_lying_small_content_length_cannot_bypass_cumulative_cap(
+    tmp_path: Path,
+) -> None:
+    """The streaming cap must override a server that declares a smaller response."""
+    image = tmp_path / "lying-length.jpg"
+    image.write_bytes(b"image")
+    stream = TrackingAsyncStream(
+        [
+            b"a" * _MAX_RESPONSE_BYTES_TEST,
+            b"overflow",
+            b"private-unread-tail",
+        ]
+    )
+
+    async with _client(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-length": "1"},
+            stream=stream,
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert stream.yielded_chunks == 2
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_response_rejects_too_many_content_blocks(tmp_path: Path) -> None:
+    """An unbounded content array would amplify parser work before normalization."""
+    image = tmp_path / "many-blocks.jpg"
+    image.write_bytes(b"image")
+    payload = _provider_response(Modality.IMAGE)
+    valid_text = cast(list[dict[str, str]], payload["content"])[0]["text"]
+    payload["content"] = [
+        {"type": "text", "text": valid_text},
+        *[
+            {"type": "text", "text": " "}
+            for _ in range(_MAX_CONTENT_BLOCKS_TEST)
+        ],
+    ]
+
+    async with _client(
+        lambda request: httpx.Response(200, json=payload)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+
+
+@pytest.mark.asyncio
+async def test_response_rejects_oversized_text_block_before_normalization(
+    tmp_path: Path,
+) -> None:
+    """Whitespace cannot be used to inflate one text block past its parser bound."""
+    image = tmp_path / "large-block.jpg"
+    image.write_bytes(b"image")
+    payload = _provider_response(Modality.IMAGE)
+    content = cast(list[dict[str, str]], payload["content"])
+    content[0]["text"] += " " * (_MAX_TEXT_BLOCK_CHARS_TEST + 1)
+
+    async with _client(
+        lambda request: httpx.Response(200, json=payload)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+
+
+@pytest.mark.asyncio
+async def test_response_rejects_oversized_combined_text_before_normalization(
+    tmp_path: Path,
+) -> None:
+    """Many individually valid text blocks must still obey one combined-text cap."""
+    image = tmp_path / "combined-text.jpg"
+    image.write_bytes(b"image")
+    payload = _provider_response(Modality.IMAGE)
+    valid_text = cast(list[dict[str, str]], payload["content"])[0]["text"]
+    padding_size = _MAX_COMBINED_TEXT_CHARS_TEST // 2 + 1
+    payload["content"] = [
+        {"type": "text", "text": valid_text + " " * padding_size},
+        {"type": "text", "text": " " * padding_size},
+    ]
+
+    async with _client(
+        lambda request: httpx.Response(200, json=payload)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+
+
+@pytest.mark.asyncio
+async def test_streaming_response_is_closed_when_call_is_cancelled(tmp_path: Path) -> None:
+    """Cancellation during download must release the active HTTP response promptly."""
+    image = tmp_path / "stream-cancel.jpg"
+    image.write_bytes(b"image")
+    stream = BlockingAsyncStream()
+
+    async with _client(
+        lambda request: httpx.Response(200, stream=stream)
+    ) as client:
+        task = asyncio.create_task(
+            _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+        )
+        await stream.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert stream.closed is True
 
 
 @pytest.mark.parametrize(
@@ -792,21 +1346,29 @@ async def test_unexpected_transport_failure_is_sanitized(tmp_path: Path) -> None
     assert "raw-secret-marker" not in str(caught.value)
 
 
+@pytest.mark.parametrize("status_code", [307, 308])
 @pytest.mark.asyncio
-async def test_cross_origin_redirect_is_not_followed(tmp_path: Path) -> None:
-    """Following a cross-origin redirect would disclose the key and encoded media."""
+async def test_borrowed_redirecting_client_cannot_replay_secret_or_media_cross_origin(
+    tmp_path: Path,
+    status_code: int,
+) -> None:
+    """Per-request redirect control must override a borrowed client's unsafe default."""
     image = tmp_path / "redirect.jpg"
-    image.write_bytes(b"image")
-    urls: list[str] = []
+    media_marker = b"private-redirect-media-marker"
+    image.write_bytes(media_marker)
+    requests: list[httpx.Request] = []
+    attacker_url = "https://attacker.example.invalid/collect"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        urls.append(str(request.url))
+        requests.append(request)
+        if request.url.host == "attacker.example.invalid":
+            pytest.fail("redirect replay reached the attacker origin")
         return httpx.Response(
-            307,
-            headers={"location": "https://attacker.example.invalid/collect"},
+            status_code,
+            headers={"location": attacker_url},
         )
 
-    async with _client(handler) as client:
+    async with _client(handler, follow_redirects=True) as client:
         with pytest.raises(SensoryError) as caught:
             await _provider(client).sense(
                 _request(
@@ -818,8 +1380,12 @@ async def test_cross_origin_redirect_is_not_followed(tmp_path: Path) -> None:
             )
 
     assert caught.value.code is ErrorCode.PROVIDER_UNAVAILABLE
-    assert urls == [f"{MINIMAX_GLOBAL_BASE_URL}/anthropic/v1/messages"]
-    assert "attacker" not in str(caught.value)
+    assert [str(request.url) for request in requests] == [
+        f"{MINIMAX_GLOBAL_BASE_URL}/anthropic/v1/messages"
+    ]
+    public_text = str(caught.value)
+    for private_value in (attacker_url, _SECRET, media_marker.decode("ascii")):
+        assert private_value not in public_text
 
 
 @pytest.mark.asyncio

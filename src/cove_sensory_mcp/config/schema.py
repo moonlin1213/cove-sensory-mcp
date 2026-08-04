@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -13,9 +14,12 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictStr,
+    ValidationError,
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from cove_sensory_mcp.models import Modality, ProviderId, RouteConfig
 
@@ -55,6 +59,17 @@ _MAX_INLINE_BYTES = 1_073_741_824
 _MAX_OUTPUT_TOKENS = 1_000_000
 _MAX_REQUEST_TIMEOUT_SECONDS = 3_600
 _MAX_ENDPOINT_PATH_LENGTH = 1_024
+_ADAPTER_OPTION_NAMES = frozenset(
+    {
+        "inline_max_bytes",
+        "max_output_tokens",
+        "temperature",
+        "request_timeout_seconds",
+        "endpoint_path",
+        "media_part_mode",
+    }
+)
+_INVALID_ADAPTER_OPTIONS_MESSAGE = "Adapter options contain an unsupported field."
 
 
 def _contains_credential_parameter(component: str) -> bool:
@@ -113,7 +128,7 @@ class AdapterOptions(BaseModel):
             allow_inf_nan=False,
         ),
     ] | None = None
-    endpoint_path: str | None = Field(
+    endpoint_path: StrictStr | None = Field(
         default=None,
         min_length=1,
         max_length=_MAX_ENDPOINT_PATH_LENGTH,
@@ -124,6 +139,29 @@ class AdapterOptions(BaseModel):
         "video_url_data_uri",
         "anthropic_base64_media",
     ] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unknown_options(cls, value: object) -> object:
+        """Reject unknown keys without placing attacker-controlled data in errors."""
+        if isinstance(value, Mapping) and any(
+            key not in _ADAPTER_OPTION_NAMES for key in value
+        ):
+            raise ValidationError.from_exception_data(
+                cls.__name__,
+                [
+                    InitErrorDetails(
+                        type=PydanticCustomError(
+                            "adapter_options_invalid",
+                            _INVALID_ADAPTER_OPTIONS_MESSAGE,
+                        ),
+                        loc=(),
+                        input=None,
+                    )
+                ],
+                hide_input=True,
+            )
+        return value
 
     @field_validator("endpoint_path")
     @classmethod

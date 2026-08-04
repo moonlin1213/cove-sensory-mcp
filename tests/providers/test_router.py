@@ -8,9 +8,14 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig, RoutesConfig
+from cove_sensory_mcp.config.schema import (
+    AdapterOptions,
+    AppConfig,
+    ProviderConfig,
+    RoutesConfig,
+)
 from cove_sensory_mcp.config.store import ConfigStore
-from cove_sensory_mcp.errors import ErrorCode, SensoryError
+from cove_sensory_mcp.errors import ErrorCode, SensoryError, error_result
 from cove_sensory_mcp.models import Modality, ProviderRef, RouteConfig
 from cove_sensory_mcp.providers.base import SensoryProvider
 from cove_sensory_mcp.providers.registry import ProviderRegistry
@@ -565,6 +570,94 @@ def test_unsafe_adapter_option_validation_hides_private_input() -> None:
         )
 
     assert private not in str(exc_info.value)
+
+
+def test_adapter_options_unknown_key_error_hides_private_key_and_value() -> None:
+    """Removing pre-validation would expose an attacker-chosen key in diagnostics."""
+    marker = "private-marker"
+    unknown_key = f"{marker}-access-token-ref"
+    private_value = f"{marker}-plaintext-value"
+
+    with pytest.raises(ValidationError) as exc_info:
+        AdapterOptions.model_validate({unknown_key: private_value})
+
+    errors = exc_info.value.errors()
+    diagnostics = f"{exc_info.value}\n{errors!r}"
+    assert len(errors) == 1
+    assert errors[0]["loc"] == ()
+    assert unknown_key not in diagnostics
+    assert private_value not in diagnostics
+    assert marker not in diagnostics
+
+
+def test_provider_config_unknown_adapter_key_error_hides_private_key_and_value() -> None:
+    """Nested validation must preserve the same non-echo contract."""
+    marker = "private-marker"
+    unknown_key = f"{marker}-http-header"
+    private_value = f"{marker}-bearer-value"
+
+    with pytest.raises(ValidationError) as exc_info:
+        ProviderConfig(
+            adapter="openai-compatible",
+            model="test-model",
+            credential_ref="safe-reference",
+            adapter_options={unknown_key: private_value},
+        )
+
+    errors = exc_info.value.errors()
+    diagnostics = f"{exc_info.value}\n{errors!r}"
+    assert len(errors) == 1
+    assert errors[0]["loc"] == ("adapter_options",)
+    assert unknown_key not in diagnostics
+    assert private_value not in diagnostics
+    assert marker not in diagnostics
+
+
+def test_config_store_unknown_adapter_key_error_hides_private_key_and_value(
+    tmp_path: Path,
+) -> None:
+    """The public error and retained cause must not disclose rejected YAML fields."""
+    marker = "private-marker"
+    unknown_key = f"{marker}-private-key-file"
+    private_value = f"{marker}-plaintext-value"
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "providers": {
+                    "custom": {
+                        "adapter": "openai-compatible",
+                        "model": "test-model",
+                        "credential_ref": "safe-reference",
+                        "adapter_options": {unknown_key: private_value},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SensoryError) as exc_info:
+        ConfigStore(path).load()
+
+    error = exc_info.value
+    cause = cast(ValidationError, error.__cause__)
+    diagnostics = (
+        f"{error}\n{error!r}\n{error_result(error)!r}\n"
+        f"{cause}\n{cause.errors()!r}"
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID
+    assert str(error) == "The configuration file is invalid."
+    assert unknown_key not in diagnostics
+    assert private_value not in diagnostics
+    assert marker not in diagnostics
+
+
+def test_adapter_options_rejects_bytes_endpoint_path() -> None:
+    """Relaxing strict string input could silently decode an unintended bytes path."""
+    with pytest.raises(ValidationError):
+        AdapterOptions.model_validate({"endpoint_path": b"/v1/responses"})
 
 
 def test_known_adapter_options_remain_portable(tmp_path: Path) -> None:

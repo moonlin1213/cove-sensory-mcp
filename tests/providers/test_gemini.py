@@ -4,10 +4,14 @@ import asyncio
 import json
 import logging
 import secrets
+from contextlib import suppress
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
+from google import genai as google_genai
+from google.genai import types as google_types
 
 from cove_sensory_mcp.config.schema import AdapterOptions, ProviderConfig
 from cove_sensory_mcp.config.secrets import MemorySecretStore
@@ -23,6 +27,7 @@ from cove_sensory_mcp.providers.gemini import (
     GeminiProvider,
     GeminiRemoteFile,
     GeminiUploadedMedia,
+    _OfficialGoogleGenAIClient,
 )
 
 
@@ -57,6 +62,12 @@ class FakeGeminiClient:
         self.wait_gate: asyncio.Event | None = None
         self.generate_error: BaseException | None = None
         self.delete_error: Exception | None = None
+        self.delete_started = asyncio.Event()
+        self.delete_gate: asyncio.Event | None = None
+        self.delete_finished = False
+        self.close_started = asyncio.Event()
+        self.close_gate: asyncio.Event | None = None
+        self.close_finished = False
 
     async def upload_file(self, *, path: Path, mime_type: str) -> GeminiRemoteFile:
         self.uploads.append((path, mime_type))
@@ -98,11 +109,19 @@ class FakeGeminiClient:
 
     async def delete_file(self, *, name: str) -> None:
         self.deleted_names.append(name)
+        self.delete_started.set()
+        if self.delete_gate is not None:
+            await self.delete_gate.wait()
         if self.delete_error is not None:
             raise self.delete_error
+        self.delete_finished = True
 
     async def aclose(self) -> None:
+        self.close_started.set()
+        if self.close_gate is not None:
+            await self.close_gate.wait()
         self.closed = True
+        self.close_finished = True
 
 
 class FakeClientFactory:
@@ -197,11 +216,14 @@ async def test_small_image_uses_inline_bytes_without_remote_upload(tmp_path: Pat
     )
 
     contents = cast(tuple[object, ...], client.generate_calls[0]["contents"])
-    assert isinstance(contents[0], str)
-    assert contents[1] == GeminiInlineMedia(data=media_bytes, mime_type="image/png")
+    assert contents[0] == GeminiInlineMedia(data=media_bytes, mime_type="image/png")
+    assert isinstance(contents[1], str)
     assert client.uploads == []
     assert client.deleted_names == []
     assert result.remote_file_deleted is None
+    assert result.provider_id == "gemini"
+    assert result.model == "gemini-test-model"
+    assert set(result.observations) == {Modality.IMAGE}
     assert result.observations[Modality.IMAGE].summary == "Observed image."
 
 
@@ -443,6 +465,75 @@ async def test_uploaded_file_is_deleted_when_processing_wait_is_cancelled(
     assert client.deleted_names == ["files/test-upload"]
 
 
+@pytest.mark.asyncio
+async def test_remote_delete_reaches_terminal_state_before_two_cancellations_propagate(
+    tmp_path: Path,
+) -> None:
+    """A second cancellation must not cancel the independently owned delete task."""
+    video = tmp_path / "double-cancel.mp4"
+    video.write_bytes(b"video")
+    client = FakeGeminiClient(
+        GeminiGeneration(text=_response_text(Modality.VIDEO_VISUAL))
+    )
+    client.delete_gate = asyncio.Event()
+    task = asyncio.create_task(
+        _provider(client).sense(
+            _request(
+                video,
+                media_kind=MediaKind.VIDEO,
+                mime_type="video/mp4",
+                modalities=frozenset({Modality.VIDEO_VISUAL}),
+            )
+        )
+    )
+    await client.delete_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert task.done() is False
+    client.delete_gate.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.delete_finished is True
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provider_close_reaches_terminal_state_before_cancellation_propagates(
+    tmp_path: Path,
+) -> None:
+    """Cancellation during provider close must not abandon the injected client close."""
+    image = tmp_path / "close-cancel.png"
+    image.write_bytes(b"image")
+    client = FakeGeminiClient(GeminiGeneration(text=_response_text(Modality.IMAGE)))
+    client.close_gate = asyncio.Event()
+    task = asyncio.create_task(
+        _provider(client).sense(
+            _request(
+                image,
+                media_kind=MediaKind.IMAGE,
+                mime_type="image/png",
+                modalities=frozenset({Modality.IMAGE}),
+            )
+        )
+    )
+    await client.close_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert task.done() is False
+    client.close_gate.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.close_finished is True
+
+
 @pytest.mark.parametrize(
     ("failure", "expected_code", "retryable"),
     [
@@ -625,6 +716,23 @@ async def test_logs_and_public_error_never_include_private_transport_data(
     for private_value in (credential, media_marker.decode(), raw_marker, header_marker):
         assert private_value not in rendered
         assert private_value not in public_text
+    failure_record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "provider_request_failed"
+    )
+    safe_record = cast(Any, failure_record)
+    assert len(cast(str, safe_record.request_id)) == 32
+    assert safe_record.provider_id == "gemini"
+    assert safe_record.model == "gemini-test-model"
+    assert safe_record.modality == "image"
+    assert safe_record.latency_bucket in {
+        "under_1s",
+        "1_to_5s",
+        "5_to_30s",
+        "30s_or_more",
+    }
+    assert safe_record.error_code == ErrorCode.PROVIDER_UNAVAILABLE.value
     assert caught.value.code is ErrorCode.PROVIDER_UNAVAILABLE
     assert caught.value.cause is None
 
@@ -646,3 +754,417 @@ async def test_client_is_closed_after_each_call(tmp_path: Path) -> None:
     )
 
     assert client.closed is True
+
+
+class _SyncFilesForbidden:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def upload(self, **_kwargs: object) -> object:
+        self.calls.append("upload")
+        raise AssertionError("the synchronous Files API must not be used")
+
+    def get(self, **_kwargs: object) -> object:
+        self.calls.append("get")
+        raise AssertionError("the synchronous Files API must not be used")
+
+    def delete(self, **_kwargs: object) -> object:
+        self.calls.append("delete")
+        raise AssertionError("the synchronous Files API must not be used")
+
+
+class _AsyncFilesSpy:
+    def __init__(self) -> None:
+        self.upload_calls: list[dict[str, object]] = []
+        self.get_calls: list[dict[str, object]] = []
+        self.delete_calls: list[dict[str, object]] = []
+        self.upload_started = asyncio.Event()
+        self.upload_gate: asyncio.Event | None = None
+        self.upload_cancelled = False
+        self.get_responses: list[object] = [
+            SimpleNamespace(
+                name="files/official-upload",
+                uri="https://files.example.invalid/official-upload",
+                mime_type="video/mp4",
+                state=SimpleNamespace(name="ACTIVE"),
+            )
+        ]
+
+    async def upload(self, **kwargs: object) -> object:
+        self.upload_calls.append(kwargs)
+        self.upload_started.set()
+        try:
+            if self.upload_gate is not None:
+                await self.upload_gate.wait()
+        except asyncio.CancelledError:
+            self.upload_cancelled = True
+            raise
+        return SimpleNamespace(
+            name="files/official-upload",
+            uri="https://files.example.invalid/official-upload",
+            mime_type="video/mp4",
+        )
+
+    async def get(self, **kwargs: object) -> object:
+        self.get_calls.append(kwargs)
+        return self.get_responses.pop(0)
+
+    async def delete(self, **kwargs: object) -> object:
+        self.delete_calls.append(kwargs)
+        return SimpleNamespace()
+
+
+class _AsyncModelsSpy:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.response: object = SimpleNamespace(
+            text="sanitized response text",
+            prompt_feedback=SimpleNamespace(block_reason=None),
+            candidates=[],
+        )
+
+    async def generate_content(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return self.response
+
+
+class _OfficialSDKClientSpy:
+    def __init__(self) -> None:
+        self.files = _SyncFilesForbidden()
+        self.async_files = _AsyncFilesSpy()
+        self.async_models = _AsyncModelsSpy()
+        self.async_close_started = asyncio.Event()
+        self.async_close_gate: asyncio.Event | None = None
+        self.async_close_calls = 0
+        self.async_close_error: Exception | None = None
+        self.sync_close_calls = 0
+        self.sync_close_error: Exception | None = None
+        self.aio = SimpleNamespace(
+            files=self.async_files,
+            models=self.async_models,
+            aclose=self._async_close,
+        )
+
+    async def _async_close(self) -> None:
+        self.async_close_calls += 1
+        self.async_close_started.set()
+        if self.async_close_gate is not None:
+            await self.async_close_gate.wait()
+        if self.async_close_error is not None:
+            raise self.async_close_error
+
+    def close(self) -> None:
+        self.sync_close_calls += 1
+        if self.sync_close_error is not None:
+            raise self.sync_close_error
+
+
+async def _event_set_within(event: asyncio.Event, timeout: float = 0.1) -> bool:
+    try:
+        await asyncio.wait_for(event.wait(), timeout)
+    except TimeoutError:
+        return False
+    return True
+
+
+def _install_official_sdk_spies(
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_client: _OfficialSDKClientSpy,
+) -> dict[str, list[dict[str, object]]]:
+    typed_calls: dict[str, list[dict[str, object]]] = {
+        "http_options": [],
+        "upload_config": [],
+        "part_text": [],
+        "part_bytes": [],
+        "part_uri": [],
+        "generation_config": [],
+        "content": [],
+        "client": [],
+    }
+
+    class PartFactory:
+        @staticmethod
+        def from_text(**kwargs: object) -> tuple[str, dict[str, object]]:
+            typed_calls["part_text"].append(kwargs)
+            return "text", kwargs
+
+        @staticmethod
+        def from_bytes(**kwargs: object) -> tuple[str, dict[str, object]]:
+            typed_calls["part_bytes"].append(kwargs)
+            return "bytes", kwargs
+
+        @staticmethod
+        def from_uri(**kwargs: object) -> tuple[str, dict[str, object]]:
+            typed_calls["part_uri"].append(kwargs)
+            return "uri", kwargs
+
+    def typed_factory(name: str) -> Any:
+        def factory(**kwargs: object) -> tuple[str, dict[str, object]]:
+            typed_calls[name].append(kwargs)
+            return name, kwargs
+
+        return factory
+
+    def client_factory(**kwargs: object) -> _OfficialSDKClientSpy:
+        typed_calls["client"].append(kwargs)
+        return sdk_client
+
+    monkeypatch.setattr(google_genai, "Client", client_factory)
+    monkeypatch.setattr(google_types, "HttpOptions", typed_factory("http_options"))
+    monkeypatch.setattr(
+        google_types,
+        "UploadFileConfig",
+        typed_factory("upload_config"),
+    )
+    monkeypatch.setattr(google_types, "Part", PartFactory)
+    monkeypatch.setattr(
+        google_types,
+        "GenerateContentConfig",
+        typed_factory("generation_config"),
+    )
+    monkeypatch.setattr(google_types, "Content", typed_factory("content"))
+    return typed_calls
+
+
+@pytest.mark.asyncio
+async def test_official_wrapper_uses_async_files_with_typed_upload_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker-thread Files calls can finish after cancellation without a cleanup identity."""
+    sdk_client = _OfficialSDKClientSpy()
+    typed_calls = _install_official_sdk_spies(monkeypatch, sdk_client)
+    credential = secrets.token_urlsafe(24)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=credential,
+        base_url="https://gateway.example.invalid",
+    )
+    media = tmp_path / "official.mp4"
+    media.write_bytes(b"video")
+
+    uploaded = await wrapper.upload_file(path=media, mime_type="video/mp4")
+    active = await wrapper.wait_until_active(uploaded)
+    await wrapper.delete_file(name=uploaded.name)
+
+    assert typed_calls["client"] == [
+        {
+            "api_key": credential,
+            "http_options": (
+                "http_options",
+                {"base_url": "https://gateway.example.invalid"},
+            ),
+        }
+    ]
+    assert typed_calls["upload_config"] == [{"mime_type": "video/mp4"}]
+    assert sdk_client.async_files.upload_calls == [
+        {"file": media, "config": ("upload_config", {"mime_type": "video/mp4"})}
+    ]
+    assert sdk_client.async_files.get_calls == [{"name": "files/official-upload"}]
+    assert sdk_client.async_files.delete_calls == [
+        {"name": "files/official-upload"}
+    ]
+    assert sdk_client.files.calls == []
+    assert active == uploaded
+
+
+@pytest.mark.asyncio
+async def test_official_async_upload_propagates_cancellation_without_sync_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation must reach the SDK upload operation instead of abandoning a thread."""
+    sdk_client = _OfficialSDKClientSpy()
+    sdk_client.async_files.upload_gate = asyncio.Event()
+    _install_official_sdk_spies(monkeypatch, sdk_client)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+    media = tmp_path / "cancel-upload.wav"
+    media.write_bytes(b"audio")
+    task = asyncio.create_task(
+        wrapper.upload_file(path=media, mime_type="audio/wav")
+    )
+    try:
+        assert await _event_set_within(sdk_client.async_files.upload_started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError, GeminiClientFailure):
+            await task
+
+    assert sdk_client.async_files.upload_cancelled is True
+    assert sdk_client.files.calls == []
+
+
+@pytest.mark.asyncio
+async def test_official_wrapper_constructs_typed_parts_and_uses_async_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bypassing typed parts could silently change media encoding or request ordering."""
+    sdk_client = _OfficialSDKClientSpy()
+    typed_calls = _install_official_sdk_spies(monkeypatch, sdk_client)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+
+    generation = await wrapper.generate_content(
+        model="gemini-test-model",
+        contents=(
+            GeminiInlineMedia(data=b"image", mime_type="image/png"),
+            GeminiUploadedMedia(
+                uri="https://files.example.invalid/video",
+                mime_type="video/mp4",
+            ),
+            "prompt",
+        ),
+        max_output_tokens=321,
+        temperature=0.7,
+    )
+
+    assert typed_calls["part_bytes"] == [
+        {"data": b"image", "mime_type": "image/png"}
+    ]
+    assert typed_calls["part_uri"] == [
+        {
+            "file_uri": "https://files.example.invalid/video",
+            "mime_type": "video/mp4",
+        }
+    ]
+    assert typed_calls["part_text"] == [{"text": "prompt"}]
+    assert typed_calls["generation_config"] == [
+        {
+            "max_output_tokens": 321,
+            "temperature": 0.7,
+            "response_mime_type": "application/json",
+        }
+    ]
+    assert len(sdk_client.async_models.calls) == 1
+    assert sdk_client.async_models.calls[0]["model"] == "gemini-test-model"
+    assert generation == GeminiGeneration(text="sanitized response text")
+
+
+@pytest.mark.asyncio
+async def test_official_wrapper_waits_for_explicit_active_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treating a missing or unknown state as active could generate from unready media."""
+    sdk_client = _OfficialSDKClientSpy()
+    sdk_client.async_files.get_responses = [
+        SimpleNamespace(state=None),
+        SimpleNamespace(state=SimpleNamespace(name="QUEUED")),
+        SimpleNamespace(
+            name="files/official-upload",
+            uri="https://files.example.invalid/official-upload",
+            mime_type="video/mp4",
+            state=SimpleNamespace(name="ACTIVE"),
+        ),
+    ]
+    _install_official_sdk_spies(monkeypatch, sdk_client)
+    monkeypatch.setattr(
+        "cove_sensory_mcp.providers.gemini._FILE_POLL_INTERVAL_SECONDS",
+        0,
+    )
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+    remote = GeminiRemoteFile(
+        name="files/official-upload",
+        uri="https://files.example.invalid/official-upload",
+        mime_type="video/mp4",
+    )
+
+    active = await wrapper.wait_until_active(remote)
+
+    assert active == remote
+    assert sdk_client.async_files.get_calls == [
+        {"name": "files/official-upload"},
+        {"name": "files/official-upload"},
+        {"name": "files/official-upload"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_official_wrapper_rejects_explicit_failed_file_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Polling after an explicit Files failure would hide a terminal Provider rejection."""
+    sdk_client = _OfficialSDKClientSpy()
+    sdk_client.async_files.get_responses = [
+        SimpleNamespace(state=SimpleNamespace(name="FAILED"))
+    ]
+    _install_official_sdk_spies(monkeypatch, sdk_client)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+    remote = GeminiRemoteFile(
+        name="files/official-upload",
+        uri="https://files.example.invalid/official-upload",
+        mime_type="video/mp4",
+    )
+
+    with pytest.raises(GeminiClientFailure) as caught:
+        await wrapper.wait_until_active(remote)
+
+    assert caught.value.kind is GeminiFailureKind.UNAVAILABLE
+    assert len(sdk_client.async_files.get_calls) == 1
+
+
+@pytest.mark.parametrize("failing_transport", ["async", "sync"])
+@pytest.mark.asyncio
+async def test_official_wrapper_closes_both_transports_when_either_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_transport: str,
+) -> None:
+    """Either close error must not prevent closure of the other SDK transport."""
+    sdk_client = _OfficialSDKClientSpy()
+    if failing_transport == "async":
+        sdk_client.async_close_error = OSError("private async close detail")
+    else:
+        sdk_client.sync_close_error = OSError("private sync close detail")
+    _install_official_sdk_spies(monkeypatch, sdk_client)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+
+    with pytest.raises(GeminiClientFailure) as caught:
+        await wrapper.aclose()
+
+    assert caught.value.kind is GeminiFailureKind.UNAVAILABLE
+    assert sdk_client.async_close_calls == 1
+    assert sdk_client.sync_close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_official_wrapper_close_survives_two_cancellations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated cancellation must wait for both independently owned close operations."""
+    sdk_client = _OfficialSDKClientSpy()
+    sdk_client.async_close_gate = asyncio.Event()
+    _install_official_sdk_spies(monkeypatch, sdk_client)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+    task = asyncio.create_task(wrapper.aclose())
+    await sdk_client.async_close_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert task.done() is False
+    sdk_client.async_close_gate.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sdk_client.async_close_calls == 1
+    assert sdk_client.sync_close_calls == 1

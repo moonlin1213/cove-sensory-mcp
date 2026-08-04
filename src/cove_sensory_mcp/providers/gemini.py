@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from cove_sensory_mcp.config.schema import ProviderConfig
 from cove_sensory_mcp.config.secrets import SecretStore
@@ -30,6 +30,7 @@ _SAFETY_MESSAGE = "The provider rejected the request for safety reasons."
 _TIMEOUT_MESSAGE = "The provider request timed out."
 _UNAVAILABLE_MESSAGE = "The provider is temporarily unavailable."
 _CAPABILITY_MESSAGE = "The provider cannot process the requested media modalities."
+_TaskResult = TypeVar("_TaskResult")
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +190,28 @@ def _is_safety_rejection(response: object) -> bool:
     )
 
 
+async def _await_owned_task(
+    task: asyncio.Task[_TaskResult],
+) -> tuple[_TaskResult | None, BaseException | None, bool]:
+    """Await an owned task to terminal despite repeated caller cancellation."""
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                interrupted = True
+        except BaseException:  # noqa: BLE001 - outcome is read only after terminal
+            break
+    if task.cancelled():
+        return None, asyncio.CancelledError(), interrupted
+    failure = task.exception()
+    if failure is not None:
+        return None, failure, interrupted
+    return task.result(), None, interrupted
+
+
 class _OfficialGoogleGenAIClient:
     """Compatibility wrapper for the bounded google-genai 2.x dependency."""
 
@@ -203,8 +226,7 @@ class _OfficialGoogleGenAIClient:
     async def upload_file(self, *, path: Path, mime_type: str) -> GeminiRemoteFile:
         try:
             config = self._types.UploadFileConfig(mime_type=mime_type)
-            uploaded = await asyncio.to_thread(
-                self._client.files.upload,
+            uploaded = await self._client.aio.files.upload(
                 file=path,
                 config=config,
             )
@@ -230,9 +252,9 @@ class _OfficialGoogleGenAIClient:
         current = file
         while True:
             try:
-                remote = await asyncio.to_thread(self._client.files.get, name=current.name)
+                remote = await self._client.aio.files.get(name=current.name)
                 state = _enum_name(getattr(remote, "state", None))
-                if state in {"", "ACTIVE"}:
+                if state == "ACTIVE":
                     name = getattr(remote, "name", current.name)
                     uri = getattr(remote, "uri", current.uri)
                     mime_type = getattr(remote, "mime_type", current.mime_type)
@@ -308,7 +330,7 @@ class _OfficialGoogleGenAIClient:
 
     async def delete_file(self, *, name: str) -> None:
         try:
-            await asyncio.to_thread(self._client.files.delete, name=name)
+            await self._client.aio.files.delete(name=name)
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -316,20 +338,13 @@ class _OfficialGoogleGenAIClient:
             raise GeminiClientFailure(kind) from None
 
     async def aclose(self) -> None:
-        close_failed = False
-        try:
-            await self._client.aio.aclose()
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            close_failed = True
-        try:
-            await asyncio.to_thread(self._client.close)
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            close_failed = True
-        if close_failed:
+        async_close = asyncio.create_task(self._client.aio.aclose())
+        sync_close = asyncio.create_task(asyncio.to_thread(self._client.close))
+        _, async_failure, async_interrupted = await _await_owned_task(async_close)
+        _, sync_failure, sync_interrupted = await _await_owned_task(sync_close)
+        if async_interrupted or sync_interrupted:
+            raise asyncio.CancelledError
+        if async_failure is not None or sync_failure is not None:
             raise GeminiClientFailure(GeminiFailureKind.UNAVAILABLE) from None
 
 
@@ -416,17 +431,18 @@ async def _delete_remote_file(
             timeout=timeout_seconds,
         )
     )
-    try:
-        await asyncio.shield(cleanup_task)
-    except asyncio.CancelledError:
-        try:
-            await cleanup_task
-        except Exception:  # noqa: BLE001, S110 - primary cancellation stays authoritative
-            pass
-        raise
-    except Exception:  # noqa: BLE001 - cleanup must never mask the primary outcome
-        return False
-    return True
+    _, failure, interrupted = await _await_owned_task(cleanup_task)
+    if interrupted:
+        raise asyncio.CancelledError
+    return failure is None
+
+
+async def _close_client(client: GeminiClient) -> bool:
+    close_task = asyncio.create_task(client.aclose())
+    _, failure, interrupted = await _await_owned_task(close_task)
+    if interrupted:
+        raise asyncio.CancelledError
+    return failure is None
 
 
 class GeminiProvider:
@@ -490,7 +506,7 @@ class GeminiProvider:
         media: GeminiInlineMedia | GeminiUploadedMedia,
     ) -> tuple[GeminiContent, ...]:
         prompt = self._prompt(request)
-        if request.media.media_kind is MediaKind.VIDEO:
+        if request.media.media_kind in {MediaKind.IMAGE, MediaKind.VIDEO}:
             return media, prompt
         return prompt, media
 
@@ -595,9 +611,7 @@ class GeminiProvider:
                                 error_code="REMOTE_FILE_DELETE_FAILED",
                             )
                 finally:
-                    try:
-                        await client.aclose()
-                    except Exception:  # noqa: BLE001 - close failure cannot mask outcome
+                    if not await _close_client(client):
                         _safe_log(
                             logging.WARNING,
                             "provider_client_close_failed",

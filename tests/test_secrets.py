@@ -82,6 +82,23 @@ def test_keyring_store_uses_project_service_name(fake_keyring: Any) -> None:
     assert store.get("gemini-main") == secret
 
 
+def test_secret_store_exists_distinguishes_free_and_occupied_references(
+    fake_keyring: Any,
+) -> None:
+    """Without a non-destructive occupancy check, configure can overwrite an existing key."""
+    keyring_store = KeyringSecretStore()
+    memory_store = MemorySecretStore()
+
+    assert keyring_store.exists("gemini-main") is False
+    assert memory_store.exists("gemini-main") is False
+
+    keyring_store.set("gemini-main", "keyring-secret-value")
+    memory_store.set("gemini-main", "memory-secret-value")
+
+    assert keyring_store.exists("gemini-main") is True
+    assert memory_store.exists("gemini-main") is True
+
+
 def test_secret_store_delete_removes_only_the_requested_reference(fake_keyring: Any) -> None:
     """Deleting a different key during config rollback would destroy unrelated credentials."""
     store = KeyringSecretStore()

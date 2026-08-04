@@ -182,6 +182,59 @@ def test_configure_minimax_custom_endpoint_rejects_secret_bearing_url(
     assert tmp_services.secret_store.values == {}
 
 
+def test_configure_minimax_custom_endpoint_with_numeric_port_is_saved(
+    tmp_services: AppServices,
+) -> None:
+    """Rejecting a valid explicit HTTPS port would block legitimate custom deployments."""
+    answers = iter(
+        [
+            "minimax-m3",
+            "minimax-main",
+            "custom",
+            "https://api.example.test:8443/v1",
+            "MiniMax-M3",
+            "n",
+        ]
+    )
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=lambda _: "minimax-test-secret",
+        output=lambda _: None,
+    ) == 0
+    assert (
+        tmp_services.config_store.load().providers["minimax-m3"].base_url
+        == "https://api.example.test:8443/v1"
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.example.test:not-a-port/v1",
+        "https://api.example.test:70000/v1",
+    ],
+)
+def test_configure_minimax_custom_endpoint_rejects_malformed_port_before_persistence(
+    tmp_services: AppServices, base_url: str
+) -> None:
+    """Deferring malformed-port failure would save an unusable endpoint and credential."""
+    answers = iter(
+        ["minimax-m3", "minimax-main", "custom", base_url, "MiniMax-M3", "n"]
+    )
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=lambda _: "minimax-test-secret",
+        output=lambda _: None,
+    ) == 1
+    assert not tmp_services.config_store.path.exists()
+    assert isinstance(tmp_services.secret_store, MemorySecretStore)
+    assert tmp_services.secret_store.values == {}
+
+
 def test_configure_custom_provider_saves_only_declared_supported_capabilities(
     tmp_services: AppServices,
 ) -> None:
@@ -246,25 +299,158 @@ def test_configure_rejects_unknown_custom_capability_without_saving(
     assert tmp_services.secret_store.values == {}
 
 
-def test_configure_cancel_does_not_save_or_prompt_for_secret(tmp_services: AppServices) -> None:
-    """Cancel must leave both config and credential storage untouched."""
+@pytest.mark.parametrize("cancel_value", ["cancel", "quit", "q"])
+@pytest.mark.parametrize(
+    "answer_prefix",
+    [
+        pytest.param([], id="provider-choice"),
+        pytest.param(["gemini"], id="gemini-credential-reference"),
+        pytest.param(["gemini", "gemini-main"], id="gemini-model"),
+        pytest.param(["minimax-m3"], id="minimax-credential-reference"),
+        pytest.param(["minimax-m3", "minimax-main"], id="minimax-region"),
+        pytest.param(
+            ["minimax-m3", "minimax-main", "custom"],
+            id="minimax-custom-url",
+        ),
+        pytest.param(
+            ["minimax-m3", "minimax-main", "global"],
+            id="minimax-model",
+        ),
+        pytest.param(["custom"], id="custom-provider-id"),
+        pytest.param(["custom", "studio-sense"], id="custom-credential-reference"),
+        pytest.param(
+            ["custom", "studio-sense", "studio-sense-key"],
+            id="custom-base-url",
+        ),
+        pytest.param(
+            [
+                "custom",
+                "studio-sense",
+                "studio-sense-key",
+                "https://api.example.test/v1",
+            ],
+            id="custom-model",
+        ),
+        pytest.param(
+            [
+                "custom",
+                "studio-sense",
+                "studio-sense-key",
+                "https://api.example.test/v1",
+                "sense-model",
+            ],
+            id="custom-capabilities",
+        ),
+    ],
+)
+def test_configure_cancel_at_any_plaintext_prompt_does_not_persist(
+    tmp_services: AppServices, answer_prefix: list[str], cancel_value: str
+) -> None:
+    """Continuing after an explicit cancellation could prompt for or persist a credential."""
+    answers = iter([*answer_prefix, cancel_value])
     secret_prompted = False
+
+    def supplied_answer(_: str) -> str:
+        try:
+            return next(answers)
+        except StopIteration:
+            pytest.fail("wizard prompted again after cancellation")
 
     def unexpected_secret_prompt(_: str) -> str:
         nonlocal secret_prompted
         secret_prompted = True
         return "must-not-be-stored"
 
+    messages: list[str] = []
     assert run_configure(
         tmp_services,
-        input_fn=lambda _: "cancel",
+        input_fn=supplied_answer,
         secret_input_fn=unexpected_secret_prompt,
-        output=lambda _: None,
+        output=messages.append,
     ) == 1
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
     assert secret_prompted is False
+    assert "cancelled" in " ".join(messages).lower()
+
+
+@pytest.mark.parametrize("cancel_exception", [EOFError, KeyboardInterrupt])
+def test_configure_hidden_secret_prompt_cancels_only_on_terminal_interruption(
+    tmp_services: AppServices, cancel_exception: type[BaseException]
+) -> None:
+    """A terminal cancellation at hidden input must stop before either persistent write."""
+    answers = iter(["gemini", "gemini-main", "gemini-test-model"])
+
+    def interrupted_secret(_: str) -> str:
+        raise cancel_exception
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=interrupted_secret,
+        output=lambda _: None,
+    ) == 1
+    assert not tmp_services.config_store.path.exists()
+    assert isinstance(tmp_services.secret_store, MemorySecretStore)
+    assert tmp_services.secret_store.values == {}
+
+
+def test_configure_does_not_parse_hidden_secret_text_as_a_cancel_command(
+    tmp_services: AppServices,
+) -> None:
+    """Secret input must remain opaque even when its text contains a cancellation word."""
+    answers = iter(["gemini", "gemini-main", "gemini-test-model", "n"])
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=lambda _: "cancel-is-part-of-this-secret",
+        output=lambda _: None,
+    ) == 0
+    assert isinstance(tmp_services.secret_store, MemorySecretStore)
+    assert tmp_services.secret_store.values == {
+        "gemini-main": "cancel-is-part-of-this-secret"
+    }
+
+
+def test_configure_refuses_occupied_secret_reference_without_overwrite_or_delete(
+    tmp_services: AppServices, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failed save after overwriting an occupied ref must not destroy its original value."""
+    original_secret = "original-secret-must-survive"
+    replacement_secret = "replacement-secret-must-not-store"
+    reference = "occupied-private-reference"
+    assert isinstance(tmp_services.secret_store, MemorySecretStore)
+    tmp_services.secret_store.set(reference, original_secret)
+    answers = iter(["gemini", reference, "gemini-test-model", "n"])
+    secret_prompted = False
+
+    def supplied_secret(_: str) -> str:
+        nonlocal secret_prompted
+        secret_prompted = True
+        return replacement_secret
+
+    def fail_save(config: AppConfig) -> None:
+        del config
+        raise OSError("forced config save failure")
+
+    monkeypatch.setattr(tmp_services.config_store, "save", fail_save)
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=supplied_secret,
+        output=lambda message: print(message),
+    ) == 1
+    assert secret_prompted is False
+    assert tmp_services.secret_store.values == {reference: original_secret}
+    assert not tmp_services.config_store.path.exists()
+    captured = capsys.readouterr()
+    public_output = captured.out + captured.err
+    assert reference not in public_output
+    assert original_secret not in public_output
+    assert replacement_secret not in public_output
 
 
 def test_configure_deletes_just_created_secret_when_config_save_fails(

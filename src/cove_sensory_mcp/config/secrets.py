@@ -24,6 +24,9 @@ _KEYRING_UNAVAILABLE_MESSAGE = (
 class SecretStore(Protocol):
     """Interface for non-config credential storage."""
 
+    def exists(self, ref: str) -> bool:
+        """Return whether a validated non-secret reference is already occupied."""
+
     def set(self, ref: str, secret: str) -> None:
         """Store one validated secret under its non-secret reference."""
 
@@ -53,6 +56,17 @@ def _missing_secret_error() -> SensoryError:
 
 class KeyringSecretStore:
     """Use the operating system's credential store for production secrets."""
+
+    def exists(self, ref: str) -> bool:
+        """Check keyring occupancy without exposing or validating the stored value."""
+        _validate_ref(ref)
+        try:
+            return keyring.get_password(_KEYRING_SERVICE_NAME, ref) is not None
+        except Exception as exc:
+            raise SensoryError(
+                ErrorCode.SETUP_REQUIRED,
+                _KEYRING_UNAVAILABLE_MESSAGE,
+            ) from exc
 
     def set(self, ref: str, secret: str) -> None:
         """Store a validated secret in the project keyring namespace."""
@@ -102,6 +116,11 @@ class MemorySecretStore:
 
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
+
+    def exists(self, ref: str) -> bool:
+        """Check test-store occupancy without returning the stored value."""
+        _validate_ref(ref)
+        return ref in self.values
 
     def set(self, ref: str, secret: str) -> None:
         """Store a validated test secret without touching persistent storage."""

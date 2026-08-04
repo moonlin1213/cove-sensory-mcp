@@ -35,6 +35,10 @@ _SAFE_PROVIDER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _CANCEL_VALUES = frozenset({"cancel", "quit", "q"})
 
 
+class _ConfigurationCancelled(Exception):
+    """Stop the local wizard before either persistent store is changed."""
+
+
 def _optional_environment_path(name: str) -> Path | None:
     value = os.environ.get(name)
     return Path(value) if value else None
@@ -54,7 +58,10 @@ def _build_services() -> AppServices:
 
 
 def _clean_answer(input_fn: InputFn, prompt: str) -> str:
-    return input_fn(prompt).strip()
+    answer = input_fn(prompt).strip()
+    if _is_cancelled(answer):
+        raise _ConfigurationCancelled
+    return answer
 
 
 def _is_cancelled(value: str) -> bool:
@@ -74,10 +81,15 @@ def _validated_model(value: str) -> str:
 
 
 def _validated_base_url(value: str) -> str:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        _port = parsed.port
+    except ValueError:
+        raise ValueError("invalid endpoint") from None
     if (
         parsed.scheme != "https"
-        or parsed.hostname is None
+        or hostname is None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -173,9 +185,6 @@ def run_configure(
             input_fn,
             "Provider [gemini/minimax-m3/custom/cancel]: ",
         ).lower()
-        if _is_cancelled(provider_choice):
-            output("Configuration cancelled; nothing was saved.")
-            return 1
         provider_id, credential_ref, provider = _provider_from_answers(
             provider_choice,
             input_fn,
@@ -186,8 +195,16 @@ def run_configure(
         ):
             output("Configuration was not saved: use a new provider and credential reference.")
             return 1
+        try:
+            occupied = services.secret_store.exists(credential_ref)
+        except SensoryError:
+            output("Configuration was not saved: local credential storage is unavailable.")
+            return 1
+        if occupied:
+            output("Configuration was not saved: the local credential reference is occupied.")
+            return 1
         secret = secret_input_fn("API key (local input, hidden): ")
-    except (EOFError, KeyboardInterrupt, StopIteration):
+    except (EOFError, KeyboardInterrupt, StopIteration, _ConfigurationCancelled):
         output("Configuration cancelled; nothing was saved.")
         return 1
     except (SensoryError, ValueError):
@@ -220,7 +237,7 @@ def run_configure(
     output("Credential: stored locally (value and reference are hidden).")
     try:
         _clean_answer(input_fn, "Configure another provider later? [y/N]: ")
-    except (EOFError, KeyboardInterrupt, StopIteration):
+    except (EOFError, KeyboardInterrupt, StopIteration, _ConfigurationCancelled):
         pass
     return 0
 

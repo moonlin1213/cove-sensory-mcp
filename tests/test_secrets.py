@@ -24,6 +24,25 @@ def test_environment_reference_wins_without_persisting(monkeypatch: pytest.Monke
     assert store.values == {}
 
 
+def test_missing_environment_reference_does_not_fall_through_to_keyring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Falling back from an explicit environment source could contact unavailable keyring."""
+    environment_name = "TEST_MISSING_API_KEY"
+    monkeypatch.delenv(environment_name, raising=False)
+
+    def unexpected_keyring_read(service_name: str, username: str) -> str | None:
+        raise AssertionError("explicit environment mode must not consult keyring")
+
+    monkeypatch.setattr(keyring, "get_password", unexpected_keyring_read)
+
+    with pytest.raises(SensoryError) as caught:
+        KeyringSecretStore().get("gemini", env_name=environment_name)
+
+    assert caught.value.code is ErrorCode.SETUP_REQUIRED
+    assert environment_name not in str(caught.value)
+
+
 def test_missing_secret_raises_public_error() -> None:
     """Exposing the missing reference would disclose private configuration details."""
     store = MemorySecretStore()

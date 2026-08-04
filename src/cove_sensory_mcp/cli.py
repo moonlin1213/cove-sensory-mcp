@@ -78,6 +78,13 @@ def _validated_model(value: str) -> str:
     return value
 
 
+def _credential_source(value: str) -> tuple[str | None, str | None]:
+    """Interpret env:NAME without changing the existing credential-prompt position."""
+    if value.startswith("env:"):
+        return None, value.removeprefix("env:")
+    return value, None
+
+
 def _declared_capabilities(value: str) -> dict[Modality, bool]:
     selected = {item.strip().lower() for item in value.split(",") if item.strip()}
     allowed = {modality.value for modality in Modality}
@@ -89,19 +96,24 @@ def _declared_capabilities(value: str) -> dict[Modality, bool]:
 def _provider_from_answers(
     provider_choice: str,
     input_fn: InputFn,
-) -> tuple[str, str, ProviderConfig]:
+) -> tuple[str, ProviderConfig]:
     if provider_choice == "gemini":
-        credential_ref = _clean_answer(input_fn, "Credential reference: ")
+        credential_ref, api_key_env = _credential_source(
+            _clean_answer(input_fn, "Credential reference (or env:VARIABLE_NAME): ")
+        )
         model = _validated_model(_clean_answer(input_fn, "Gemini model: "))
         provider = ProviderConfig(
             adapter="gemini",
             model=model,
             credential_ref=credential_ref,
+            api_key_env=api_key_env,
         )
-        return "gemini", credential_ref, provider
+        return "gemini", provider
 
     if provider_choice == "minimax-m3":
-        credential_ref = _clean_answer(input_fn, "Credential reference: ")
+        credential_ref, api_key_env = _credential_source(
+            _clean_answer(input_fn, "Credential reference (or env:VARIABLE_NAME): ")
+        )
         region = _clean_answer(input_fn, "MiniMax region [cn/global/custom]: ").lower()
         if region == "custom":
             base_url = _clean_answer(input_fn, "MiniMax base URL: ")
@@ -115,12 +127,15 @@ def _provider_from_answers(
             base_url=base_url,
             model=model,
             credential_ref=credential_ref,
+            api_key_env=api_key_env,
         )
-        return "minimax-m3", credential_ref, provider
+        return "minimax-m3", provider
 
     if provider_choice == "custom":
         provider_id = _validated_identifier(_clean_answer(input_fn, "Provider identifier: "))
-        credential_ref = _clean_answer(input_fn, "Credential reference: ")
+        credential_ref, api_key_env = _credential_source(
+            _clean_answer(input_fn, "Credential reference (or env:VARIABLE_NAME): ")
+        )
         base_url = _clean_answer(input_fn, "HTTPS base URL: ")
         model = _validated_model(_clean_answer(input_fn, "Model: "))
         declared = _declared_capabilities(
@@ -135,9 +150,10 @@ def _provider_from_answers(
             base_url=base_url,
             model=model,
             credential_ref=credential_ref,
+            api_key_env=api_key_env,
             declared_capabilities=declared,
         )
-        return provider_id, credential_ref, provider
+        return provider_id, provider
 
     raise ValueError("invalid provider")
 
@@ -155,8 +171,9 @@ def run_configure(
         "are declarations only and remain unverified."
     )
     output(
-        "Privacy: enter API keys only in this local wizard. Keys are stored in the "
-        "operating-system credential store and must never be pasted into chat."
+        "Privacy: use env:VARIABLE_NAME for an environment-only credential, or enter "
+        "an API key for the local operating-system credential store. Never paste keys "
+        "into chat."
     )
     try:
         config = services.config_store.load()
@@ -164,25 +181,31 @@ def run_configure(
             input_fn,
             "Provider [gemini/minimax-m3/custom/cancel]: ",
         ).lower()
-        provider_id, credential_ref, provider = _provider_from_answers(
+        provider_id, provider = _provider_from_answers(
             provider_choice,
             input_fn,
         )
-        if provider_id in config.providers or any(
-            configured.credential_ref == credential_ref
-            for configured in config.providers.values()
+        credential_ref = provider.credential_ref
+        if provider_id in config.providers or (
+            credential_ref is not None
+            and any(
+                configured.credential_ref == credential_ref
+                for configured in config.providers.values()
+            )
         ):
             output("Configuration was not saved: use a new provider and credential reference.")
             return 1
-        try:
-            occupied = services.secret_store.exists(credential_ref)
-        except SensoryError:
-            output("Configuration was not saved: local credential storage is unavailable.")
-            return 1
-        if occupied:
-            output("Configuration was not saved: the local credential reference is occupied.")
-            return 1
-        secret = secret_input_fn("API key (local input, hidden): ")
+        secret: str | None = None
+        if credential_ref is not None:
+            try:
+                occupied = services.secret_store.exists(credential_ref)
+            except SensoryError:
+                output("Configuration was not saved: local credential storage is unavailable.")
+                return 1
+            if occupied:
+                output("Configuration was not saved: the local credential reference is occupied.")
+                return 1
+            secret = secret_input_fn("API key (local input, hidden): ")
     except (EOFError, KeyboardInterrupt, StopIteration, _ConfigurationCancelled):
         output("Configuration cancelled; nothing was saved.")
         return 1
@@ -190,19 +213,25 @@ def run_configure(
         output("Configuration was not saved: one or more settings are invalid.")
         return 1
 
-    try:
-        services.secret_store.set(credential_ref, secret)
-    except SensoryError:
-        output("Configuration was not saved: local credential storage is unavailable.")
-        return 1
+    stored_credential_ref: str | None = None
+    if credential_ref is not None and secret is not None:
+        try:
+            services.secret_store.set(credential_ref, secret)
+        except SensoryError:
+            output("Configuration was not saved: local credential storage is unavailable.")
+            return 1
+        stored_credential_ref = credential_ref
 
     updated = config.model_copy(deep=True)
     updated.providers[provider_id] = provider
     try:
         services.config_store.save(updated)
     except (OSError, SensoryError):
+        if stored_credential_ref is None:
+            output("Configuration was not saved.")
+            return 1
         try:
-            services.secret_store.delete(credential_ref)
+            services.secret_store.delete(stored_credential_ref)
         except SensoryError:
             output(
                 "Configuration failed and credential rollback also failed; remove the "
@@ -213,7 +242,11 @@ def run_configure(
         return 1
 
     output(f"Configured provider: {provider_id}")
-    output("Credential: stored locally (value and reference are hidden).")
+    if provider.api_key_env is not None:
+        state = "available" if _credential_available(services, provider_id, provider) else "missing"
+        output(f"Credential: environment variable {state} (name and value are hidden).")
+    else:
+        output("Credential: stored locally (value and reference are hidden).")
     try:
         _clean_answer(input_fn, "Configure another provider later? [y/N]: ")
     except (EOFError, KeyboardInterrupt, StopIteration, _ConfigurationCancelled):

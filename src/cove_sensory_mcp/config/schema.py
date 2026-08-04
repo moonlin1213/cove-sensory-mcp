@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from typing import Literal
 from urllib.parse import parse_qsl, urlsplit
 
@@ -27,6 +28,7 @@ _CREDENTIAL_PARAMETER_NAMES = frozenset(
         "key",
     }
 )
+_ENVIRONMENT_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 
 
 def _contains_credential_parameter(component: str) -> bool:
@@ -68,8 +70,16 @@ class ProviderConfig(BaseModel):
     base_url: str | None = None
     model: str = Field(min_length=1)
     credential_ref: str | None = Field(default=None, min_length=1)
-    api_key_env: str | None = Field(default=None, min_length=1)
+    api_key_env: str | None = None
     declared_capabilities: dict[Modality, bool] = Field(default_factory=dict)
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_environment_variable_name(cls, value: str | None) -> str | None:
+        """Keep explicit environment references portable and bounded."""
+        if value is not None and _ENVIRONMENT_VARIABLE_NAME.fullmatch(value) is None:
+            raise ValueError("api_key_env must be a portable environment variable name")
+        return value
 
     @field_validator("base_url")
     @classmethod

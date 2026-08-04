@@ -116,6 +116,32 @@ def test_provider_schema_rejects_plaintext_api_key() -> None:
 
 
 @pytest.mark.parametrize(
+    "environment_name",
+    [
+        pytest.param("", id="blank"),
+        pytest.param("1PRIVATE_KEY", id="leading-digit"),
+        pytest.param("PRIVATE-KEY", id="hyphen"),
+        pytest.param("PRIVATE.KEY", id="dot"),
+        pytest.param("PRIVATE\nKEY", id="multiline"),
+        pytest.param("P" * 129, id="oversized"),
+    ],
+)
+def test_provider_schema_rejects_nonportable_environment_name_without_echo(
+    environment_name: str,
+) -> None:
+    """Relaxing environment-name validation could create platform-specific secret lookup."""
+    with pytest.raises(ValidationError) as exc_info:
+        ProviderConfig(
+            adapter="gemini",
+            model="gemini-test",
+            api_key_env=environment_name,
+        )
+
+    if environment_name:
+        assert environment_name not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
     "provider_id",
     [
         pytest.param("", id="blank"),

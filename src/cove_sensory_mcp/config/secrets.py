@@ -81,10 +81,13 @@ class KeyringSecretStore:
             ) from exc
 
     def get(self, ref: str, env_name: str | None = None) -> str:
-        """Return the explicit environment override before consulting the keyring."""
+        """Resolve an explicit environment source or a keyring reference, never both."""
         _validate_ref(ref)
-        if env_name is not None and env_name in os.environ:
-            secret = os.environ[env_name]
+        if env_name is not None:
+            try:
+                secret = os.environ[env_name]
+            except KeyError as exc:
+                raise _missing_secret_error() from exc
             _validate_secret(secret)
             return secret
         try:
@@ -129,10 +132,13 @@ class MemorySecretStore:
         self.values[ref] = secret
 
     def get(self, ref: str, env_name: str | None = None) -> str:
-        """Return the explicit environment override before consulting test memory."""
+        """Resolve an explicit environment source or test-memory reference, never both."""
         _validate_ref(ref)
-        if env_name is not None and env_name in os.environ:
-            secret = os.environ[env_name]
+        if env_name is not None:
+            try:
+                secret = os.environ[env_name]
+            except KeyError as exc:
+                raise _missing_secret_error() from exc
             _validate_secret(secret)
             return secret
         try:

@@ -3,6 +3,7 @@ import sys
 from importlib.metadata import requires, version
 from pathlib import Path
 
+import keyring
 import pytest
 
 from cove_sensory_mcp import __version__, cli
@@ -129,6 +130,111 @@ def test_configure_explains_capabilities_and_privacy_before_accepting_key(
         secret_input_fn=secret_after_notice,
         output=messages.append,
     ) == 0
+
+
+def test_configure_environment_reference_never_prompts_for_or_stores_key(
+    tmp_services: AppServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treating env: as a keyring reference would prompt for and persist an unwanted key."""
+    environment_name = "TEST_GEMINI_API_KEY"
+    environment_secret = "environment-secret-must-not-print"
+    monkeypatch.setenv(environment_name, environment_secret)
+    answers = iter(["gemini", f"env:{environment_name}", "gemini-test-model", "n"])
+    messages: list[str] = []
+
+    def unexpected_secret_prompt(_: str) -> str:
+        pytest.fail("environment mode must not prompt for a secret")
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=unexpected_secret_prompt,
+        output=messages.append,
+    ) == 0
+
+    provider = tmp_services.config_store.load().providers["gemini"]
+    assert provider.api_key_env == environment_name
+    assert provider.credential_ref is None
+    assert isinstance(tmp_services.secret_store, MemorySecretStore)
+    assert tmp_services.secret_store.values == {}
+    report = "\n".join(messages)
+    assert "available" in report.lower()
+    assert environment_name not in report
+    assert environment_secret not in report
+
+
+def test_configure_environment_only_succeeds_when_keyring_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consulting keyring in environment mode would block supported CI/server setup."""
+    environment_name = "TEST_SERVER_API_KEY"
+    monkeypatch.setenv(environment_name, "environment-secret-value")
+
+    def unavailable_keyring(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("keyring backend unavailable")
+
+    monkeypatch.setattr(keyring, "get_password", unavailable_keyring)
+    monkeypatch.setattr(keyring, "set_password", unavailable_keyring)
+    monkeypatch.setattr(keyring, "delete_password", unavailable_keyring)
+
+    services = AppServices(
+        config_store=ConfigStore(tmp_path / "config.yaml"),
+        secret_store=cli.KeyringSecretStore(),
+    )
+    answers = iter(["gemini", f"env:{environment_name}", "gemini-test-model", "n"])
+
+    assert run_configure(
+        services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=lambda _: pytest.fail("environment mode prompted for a key"),
+        output=lambda _: None,
+    ) == 0
+    assert services.config_store.load().providers["gemini"].api_key_env == environment_name
+
+
+def test_configure_missing_environment_reference_saves_and_reports_only_absence(
+    tmp_services: AppServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requiring an environment value at save time would make staged server setup impossible."""
+    environment_name = "TEST_LATER_API_KEY"
+    monkeypatch.delenv(environment_name, raising=False)
+    answers = iter(["gemini", f"env:{environment_name}", "gemini-test-model", "n"])
+    messages: list[str] = []
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=lambda _: pytest.fail("environment mode prompted for a key"),
+        output=messages.append,
+    ) == 0
+
+    report = "\n".join(messages)
+    assert "missing" in report.lower()
+    assert environment_name not in report
+
+
+@pytest.mark.parametrize(
+    "environment_name",
+    ["", "1PRIVATE_KEY", "PRIVATE-KEY", "PRIVATE.KEY", "PRIVATE\nKEY", "P" * 129],
+)
+def test_configure_rejects_invalid_environment_reference_without_persistence(
+    tmp_services: AppServices, environment_name: str
+) -> None:
+    """Accepting a nonportable env: form would defer failure until another platform runs it."""
+    answers = iter(["gemini", f"env:{environment_name}", "gemini-test-model", "n"])
+
+    assert run_configure(
+        tmp_services,
+        input_fn=lambda _: next(answers),
+        secret_input_fn=lambda _: pytest.fail("invalid environment mode prompted for a key"),
+        output=lambda _: None,
+    ) == 1
+    assert not tmp_services.config_store.path.exists()
+    assert isinstance(tmp_services.secret_store, MemorySecretStore)
+    assert tmp_services.secret_store.values == {}
 
 
 @pytest.mark.parametrize(

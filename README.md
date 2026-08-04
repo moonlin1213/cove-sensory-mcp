@@ -30,12 +30,18 @@ uv run cove-sensory-mcp status
 uv run cove-sensory-mcp self-test
 ```
 
-Enter API keys **only** in the local `cove-sensory-mcp configure` wizard, where hidden
-input is stored in the operating-system credential store. Never paste a key into chat,
-an MCP tool argument, the YAML configuration file, a command line, a test, or a
-snapshot. `status` and `doctor` never print key values, references, lengths, or endpoint
-headers. `doctor` checks only local config readability, credential presence, temporary
-cache creation/removal, and FFmpeg discovery; it does not contact a Provider.
+At the wizard's credential-reference prompt, enter an ordinary local reference to use
+hidden key input and the operating-system credential store. For CI or servers, enter
+`env:VARIABLE_NAME` instead; environment mode saves only the variable name, never
+prompts for a key, and reports only whether a usable value is present. Portable variable
+names start with an ASCII letter or underscore, contain only ASCII letters, digits, and
+underscores, and are at most 128 characters.
+
+Never paste a key into chat, an MCP tool argument, the YAML configuration file, a
+command line, a test, or a snapshot. `status` and `doctor` never print key values,
+references, lengths, environment-variable names, or endpoint headers. `doctor` checks
+only local config readability, credential presence, temporary cache creation/removal,
+and FFmpeg discovery; it does not contact a Provider.
 
 ## License
 

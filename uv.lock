@@ -319,6 +319,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "google-genai" },
+    { name = "httpx" },
     { name = "keyring" },
     { name = "mcp" },
     { name = "platformdirs" },
@@ -339,6 +340,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "google-genai", specifier = ">=2.12,<3" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "keyring", specifier = ">=25.0" },
     { name = "mcp", specifier = "==2.0.0" },
     { name = "platformdirs", specifier = ">=4.2" },

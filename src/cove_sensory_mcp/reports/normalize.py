@@ -133,7 +133,7 @@ def _normalize_once(
         decoded: Any = json.loads(_extract_json(text))
         normalized = _normalize_timecodes(decoded, duration_seconds)
         batch = ProviderObservationBatch.model_validate(normalized)
-    except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+    except (RecursionError, json.JSONDecodeError, TypeError, ValueError, ValidationError):
         raise _InvalidProviderResponse from None
     if frozenset(batch.by_modality()) != expected_modalities:
         raise _InvalidProviderResponse

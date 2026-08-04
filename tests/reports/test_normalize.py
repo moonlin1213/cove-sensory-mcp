@@ -110,6 +110,35 @@ def test_invalid_json_raises_raw_free_public_error() -> None:
     assert caught.value.__context__ is None
 
 
+def test_deeply_nested_provider_report_raises_raw_free_public_error() -> None:
+    private_marker = "private-recursive-report-marker"
+    depth = 10_000
+    raw = (
+        '{"observations":'
+        + "[" * depth
+        + json.dumps(private_marker)
+        + "]" * depth
+        + "}"
+    )
+
+    with pytest.raises(SensoryError) as caught:
+        _normalize(raw)
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert caught.value.retryable is False
+    assert caught.value.cause is None
+    assert caught.value.__context__ is None
+    public_result = repr(error_result(caught.value))
+    for forbidden in (
+        private_marker,
+        "RecursionError",
+        "maximum recursion depth",
+        "while decoding",
+    ):
+        assert forbidden not in str(caught.value)
+        assert forbidden not in public_result
+
+
 def test_out_of_range_segment_is_removed_with_warning() -> None:
     batch = normalize_provider_text(
         '{"observations":[{"modality":"video_visual","summary":"A scene",'

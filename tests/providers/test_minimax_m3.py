@@ -1310,6 +1310,58 @@ async def test_deeply_nested_bounded_json_cannot_escape_raw_recursion_error(
     assert stream.closed is True
 
 
+@pytest.mark.asyncio
+async def test_recursive_report_text_uses_shared_raw_free_normalizer(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A valid MiniMax success envelope must contain recursive report failures."""
+    image = tmp_path / "recursive-report.jpg"
+    image.write_bytes(b"image")
+    private_marker = "private-recursive-report-marker"
+    depth = 10_000
+    recursive_report = (
+        '{"observations":'
+        + "[" * depth
+        + json.dumps(private_marker)
+        + "]" * depth
+        + "}"
+    )
+    payload = _provider_response(Modality.IMAGE)
+    content = cast(list[dict[str, str]], payload["content"])
+    content[0]["text"] = recursive_report
+    stream = TrackingAsyncStream([json.dumps(payload).encode("utf-8")])
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(
+        lambda request: httpx.Response(200, stream=stream)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert caught.value.retryable is False
+    assert caught.value.cause is None
+    public_text = str(caught.value)
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    for forbidden in (
+        private_marker,
+        "RecursionError",
+        "maximum recursion depth",
+        "while decoding",
+    ):
+        assert forbidden not in public_text
+        assert forbidden not in log_text
+    assert stream.closed is True
+
+
 @pytest.mark.parametrize(
     ("response", "want_code"),
     [

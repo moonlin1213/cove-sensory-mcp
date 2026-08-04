@@ -52,7 +52,7 @@ def _build_services() -> AppServices:
         local=_optional_environment_path("LOCALAPPDATA"),
     )
     return AppServices(
-        config_store=ConfigStore(paths.config_file),
+        config_store=ConfigStore(paths.config_file, jobs_dir=paths.jobs_dir),
         secret_store=KeyringSecretStore(),
     )
 
@@ -284,13 +284,19 @@ def run_status(services: AppServices, output: OutputFn) -> int:
     return 0
 
 
-def _probe_cache_directory() -> bool:
+def _probe_jobs_directory(jobs_dir: Path) -> bool:
+    """Create and remove only one unique child of the configured jobs root."""
+    probe: Path | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix="cove-sensory-mcp-doctor-") as root:
-            probe = Path(root) / "cache-probe"
-            probe.mkdir()
-            probe.rmdir()
-            return not probe.exists()
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="cove-sensory-mcp-doctor-",
+            dir=jobs_dir,
+        ) as root:
+            probe = Path(root)
+            if probe.parent != jobs_dir or not probe.is_dir():
+                return False
+        return not probe.exists()
     except OSError:
         return False
 
@@ -316,7 +322,7 @@ def run_doctor(services: AppServices, output: OutputFn) -> int:
             output(f"Credential for {provider_id}: {'ok' if available else 'missing'}")
             healthy = healthy and available
 
-    cache_ok = _probe_cache_directory()
+    cache_ok = _probe_jobs_directory(services.config_store.jobs_dir)
     output(f"Cache create/remove: {'ok' if cache_ok else 'failed'}")
     healthy = healthy and cache_ok
 

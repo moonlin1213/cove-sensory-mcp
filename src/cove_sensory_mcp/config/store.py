@@ -15,13 +15,19 @@ from .schema import AppConfig
 class ConfigStore:
     """Load and atomically replace one configuration file."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, jobs_dir: Path | None = None) -> None:
         self._path = path
+        self._jobs_dir = jobs_dir if jobs_dir is not None else path.parent / "jobs"
 
     @property
     def path(self) -> Path:
         """Return the configuration location without loading it."""
         return self._path
+
+    @property
+    def jobs_dir(self) -> Path:
+        """Return the resolved root reserved for transient sensory jobs."""
+        return self._jobs_dir
 
     def load(self) -> AppConfig:
         """Load valid YAML or return the fresh-install configuration."""

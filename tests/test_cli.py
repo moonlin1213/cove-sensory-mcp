@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import tempfile
 from importlib.metadata import requires, version
 from pathlib import Path
 
@@ -668,6 +669,80 @@ def test_doctor_reports_missing_media_runtime_without_crashing(
     assert "credential" in report
     assert "cache" in report and "ok" in report
     assert "ffmpeg" in report and "missing" in report
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Windows"])
+def test_doctor_probes_and_cleans_the_injected_platform_jobs_root(
+    tmp_path: Path,
+    system: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Falling back to a generic temp root would miss failures in the configured jobs cache."""
+    roaming = tmp_path / "Roaming" if system == "Windows" else None
+    local = tmp_path / "Local" if system == "Windows" else None
+    paths = AppPaths.for_system(
+        system,
+        home=tmp_path / "Home",
+        roaming=roaming,
+        local=local,
+    )
+    monkeypatch.setattr(cli.AppPaths, "for_system", lambda *args, **kwargs: paths)
+    monkeypatch.setattr(cli, "KeyringSecretStore", MemorySecretStore)
+    monkeypatch.setattr(cli.shutil, "which", lambda executable: "/test/bin/ffmpeg")
+    real_temporary_directory = tempfile.TemporaryDirectory
+    probed_roots: list[Path | None] = []
+
+    def recording_temporary_directory(*args: object, **kwargs: object):
+        directory = kwargs.get("dir")
+        probed_roots.append(Path(directory) if isinstance(directory, (str, Path)) else None)
+        return real_temporary_directory(*args, **kwargs)
+
+    monkeypatch.setattr(cli.tempfile, "TemporaryDirectory", recording_temporary_directory)
+    services = cli._build_services()
+    assert isinstance(services.secret_store, MemorySecretStore)
+    services.secret_store.set("gemini-main", "doctor-test-secret")
+    services.config_store.save(
+        AppConfig(
+            providers={
+                "gemini": ProviderConfig(
+                    adapter="gemini",
+                    model="gemini-test",
+                    credential_ref="gemini-main",
+                )
+            }
+        )
+    )
+
+    assert run_doctor(services, output=lambda _: None) == 0
+    assert probed_roots == [paths.jobs_dir]
+    assert paths.jobs_dir.is_dir()
+    assert list(paths.jobs_dir.iterdir()) == []
+
+
+def test_doctor_bounds_jobs_probe_failure_to_the_configured_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed jobs-root probe must not switch to or remove another temporary directory."""
+    paths = AppPaths.for_system(
+        "Darwin",
+        home=tmp_path / "Home",
+        roaming=None,
+        local=None,
+    )
+    paths.jobs_dir.parent.mkdir(parents=True)
+    paths.jobs_dir.write_text("leave this configured-root blocker intact", encoding="utf-8")
+    monkeypatch.setattr(cli.AppPaths, "for_system", lambda *args, **kwargs: paths)
+    monkeypatch.setattr(cli, "KeyringSecretStore", MemorySecretStore)
+    monkeypatch.setattr(cli.shutil, "which", lambda executable: "/test/bin/ffmpeg")
+    messages: list[str] = []
+
+    assert run_doctor(cli._build_services(), output=messages.append) == 1
+
+    assert "Cache create/remove: failed" in messages
+    assert paths.jobs_dir.read_text(encoding="utf-8") == (
+        "leave this configured-root blocker intact"
+    )
 
 
 def test_foundation_self_test_subcommand_stays_local_and_reports_setup_required(

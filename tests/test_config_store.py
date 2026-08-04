@@ -120,6 +120,8 @@ def test_provider_schema_rejects_plaintext_api_key() -> None:
         "https://test-user:test-secret-never-persisted@example.test/v1",
         "https://example.test/v1?api_key=test-secret-never-persisted",
         "https://example.test/v1#access_token=test-secret-never-persisted",
+        "https://example.test/v1?mode=fast;api_key=plaintext-secret",
+        "https://example.test/v1#view=compact;access_token=plaintext-secret",
     ],
 )
 def test_provider_schema_rejects_secret_bearing_base_url_before_save(

@@ -33,7 +33,7 @@ def _contains_credential_parameter(component: str) -> bool:
     return any(
         "".join(character for character in name.lower() if character.isalnum())
         in _CREDENTIAL_PARAMETER_NAMES
-        for name, _ in parse_qsl(component, keep_blank_values=True)
+        for name, _ in parse_qsl(component.replace(";", "&"), keep_blank_values=True)
     )
 
 

@@ -28,7 +28,7 @@ def _provider(
         declared_capabilities={modality: True for modality in verified_modalities},
         verified_capabilities={modality: True for modality in verified_modalities},
         verified_joint_capabilities=list(joint),
-        adapter_options={"timeout_seconds": 30, "region": "test"},
+        adapter_options={"request_timeout_seconds": 30},
         last_verified_at=datetime(2026, 8, 4, tzinfo=UTC),
     )
 
@@ -363,6 +363,161 @@ def test_provider_capability_configuration_is_bounded(
             "private-proxy.test",
             id="proxy-endpoint-shadow",
         ),
+        pytest.param(
+            {"env_file": "private.env"},
+            "private.env",
+            id="environment-file-bypass",
+        ),
+        pytest.param(
+            {"private_key_file": "private-key.pem"},
+            "private-key.pem",
+            id="private-key-file-bypass",
+        ),
+        pytest.param(
+            {"access_token_ref": "private-token-ref"},
+            "private-token-ref",
+            id="access-token-reference-bypass",
+        ),
+        pytest.param(
+            {"http_header": "private-header-value"},
+            "private-header-value",
+            id="http-header-bypass",
+        ),
+        pytest.param(
+            {"region": "benign-looking-unknown"},
+            "benign-looking-unknown",
+            id="unknown-benign-key",
+        ),
+        pytest.param(
+            {"inline_max_bytes": {"nested": "private-nested-value"}},
+            "private-nested-value",
+            id="known-field-nested-map",
+        ),
+        pytest.param(
+            {"inline_max_bytes": "1048576"},
+            "1048576",
+            id="known-field-wrong-type",
+        ),
+        pytest.param(
+            {"inline_max_bytes": 0},
+            "custom",
+            id="nonpositive-inline-limit",
+        ),
+        pytest.param(
+            {"inline_max_bytes": 1_073_741_825},
+            "custom",
+            id="oversized-inline-limit",
+        ),
+        pytest.param(
+            {"max_output_tokens": 0},
+            "custom",
+            id="nonpositive-output-limit",
+        ),
+        pytest.param(
+            {"max_output_tokens": 1_000_001},
+            "custom",
+            id="oversized-output-limit",
+        ),
+        pytest.param(
+            {"temperature": 2.1},
+            "custom",
+            id="temperature-out-of-range",
+        ),
+        pytest.param(
+            {"request_timeout_seconds": 0},
+            "custom",
+            id="nonpositive-request-timeout",
+        ),
+        pytest.param(
+            {"request_timeout_seconds": 3_600.1},
+            "custom",
+            id="oversized-request-timeout",
+        ),
+        pytest.param(
+            {"endpoint_path": "https://private-endpoint.test/v1"},
+            "private-endpoint.test",
+            id="endpoint-path-scheme",
+        ),
+        pytest.param(
+            {"endpoint_path": "//private-endpoint.test/v1"},
+            "private-endpoint.test",
+            id="endpoint-path-host",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/responses?api_key=private"},
+            "api_key",
+            id="endpoint-path-query",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/responses#private"},
+            "private",
+            id="endpoint-path-fragment",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/../private"},
+            "private",
+            id="endpoint-path-traversal",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/%2e%2e/private"},
+            "private",
+            id="endpoint-path-encoded-traversal",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1\\private"},
+            "private",
+            id="endpoint-path-backslash",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1\nprivate"},
+            "private",
+            id="endpoint-path-control-character",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/%0aprivate"},
+            "private",
+            id="endpoint-path-encoded-control-character",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/%2525252525250aprivate"},
+            "private",
+            id="endpoint-path-deeply-encoded-control-character",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/%5cprivate"},
+            "private",
+            id="endpoint-path-encoded-backslash",
+        ),
+        pytest.param(
+            {"endpoint_path": "/%2fprivate-endpoint.test/v1"},
+            "private-endpoint.test",
+            id="endpoint-path-encoded-host",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/responses%3fprivate=query"},
+            "private",
+            id="endpoint-path-encoded-query",
+        ),
+        pytest.param(
+            {"endpoint_path": "/v1/responses%23private"},
+            "private",
+            id="endpoint-path-encoded-fragment",
+        ),
+        pytest.param(
+            {"endpoint_path": "v1/responses"},
+            "v1/responses",
+            id="endpoint-path-not-absolute-path",
+        ),
+        pytest.param(
+            {"endpoint_path": "/" + "a" * 1_024},
+            "custom",
+            id="endpoint-path-oversized",
+        ),
+        pytest.param(
+            {"media_part_mode": "private-unsupported-mode"},
+            "private-unsupported-mode",
+            id="unsupported-media-part-mode",
+        ),
     ],
 )
 def test_config_store_rejects_unsafe_adapter_options_without_echo(
@@ -412,18 +567,18 @@ def test_unsafe_adapter_option_validation_hides_private_input() -> None:
     assert private not in str(exc_info.value)
 
 
-def test_safe_scalar_and_list_adapter_options_remain_portable(tmp_path: Path) -> None:
-    """Overbroad credential filtering must not reject bounded non-secret tuning options."""
+def test_known_adapter_options_remain_portable(tmp_path: Path) -> None:
+    """The closed v1 option model must accept and round-trip every known safe field."""
     path = tmp_path / "config.yaml"
     provider = ProviderConfig(
         adapter="openai-compatible",
         model="test-model",
         credential_ref="safe-reference",
         adapter_options={
+            "inline_max_bytes": 8_388_608,
             "max_output_tokens": 4_096,
             "temperature": 0.2,
-            "retry_status_codes": [429, 503],
-            "feature_flags": [True, False],
+            "request_timeout_seconds": 30.0,
             "media_part_mode": "video_url_data_uri",
             "endpoint_path": "/v1/responses",
         },
@@ -433,7 +588,29 @@ def test_safe_scalar_and_list_adapter_options_remain_portable(tmp_path: Path) ->
     ConfigStore(path).save(expected)
 
     assert ConfigStore(path).load() == expected
+    assert provider.adapter_options.max_output_tokens == 4_096
     assert "!!python" not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "image_url_data_uri",
+        "input_audio_base64",
+        "video_url_data_uri",
+        "anthropic_base64_media",
+    ],
+)
+def test_adapter_options_accepts_each_v1_media_part_mode(mode: str) -> None:
+    """Dropping a named v1 mode would break its later compatible-adapter task."""
+    provider = ProviderConfig(
+        adapter="openai-compatible",
+        model="test-model",
+        credential_ref="safe-reference",
+        adapter_options={"media_part_mode": mode},
+    )
+
+    assert provider.adapter_options.media_part_mode == mode
 
 
 @pytest.mark.parametrize(

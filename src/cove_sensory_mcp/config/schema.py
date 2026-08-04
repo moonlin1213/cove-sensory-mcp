@@ -5,11 +5,10 @@ from __future__ import annotations
 import ipaddress
 import re
 from datetime import UTC, datetime
-from typing import Annotated, Literal, TypeAlias
-from urllib.parse import parse_qsl, urlsplit
+from typing import Annotated, Literal
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -40,116 +39,6 @@ _CREDENTIAL_PARAMETER_NAMES = frozenset(
 _ENVIRONMENT_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _MAX_CAPABILITIES = len(Modality)
 _MAX_JOINT_CAPABILITIES = 26
-_MAX_ADAPTER_OPTIONS = 32
-_MAX_ADAPTER_OPTION_ITEMS = 32
-_MAX_ADAPTER_OPTION_STRING = 2_048
-_ADAPTER_OPTION_KEY_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
-_RESERVED_ADAPTER_OPTION_KEYS = frozenset(
-    {
-        "apikey",
-        "apikeyenv",
-        "auth",
-        "authorization",
-        "authorizationheader",
-        "authorizationheaders",
-        "authheader",
-        "authheaders",
-        "baseurl",
-        "baseuri",
-        "bearer",
-        "credential",
-        "credentialref",
-        "endpoint",
-        "env",
-        "environment",
-        "environmentvariable",
-        "envsource",
-        "header",
-        "headers",
-        "key",
-        "keyring",
-        "password",
-        "passwd",
-        "proxy",
-        "secret",
-        "token",
-        "url",
-    }
-)
-# Generic storage only proves a key/value is non-secret and bounded. Adapters that use
-# known options such as endpoint_path or media_part_mode must validate their semantics.
-_SAFE_ENDPOINT_OPTION_KEYS = frozenset({"endpointpath"})
-
-
-def _normalize_config_name(value: str) -> str:
-    return "".join(character for character in value.lower() if character.isalnum())
-
-
-def _validate_adapter_option_key(value: str) -> str:
-    """Reject generic options that could shadow credentials or remote endpoints."""
-    if _ADAPTER_OPTION_KEY_PATTERN.fullmatch(value) is None:
-        raise ValueError("adapter option key is invalid")
-    normalized = _normalize_config_name(value)
-    if (
-        normalized in _RESERVED_ADAPTER_OPTION_KEYS
-        or "apikey" in normalized
-        or "authorization" in normalized
-        or "credential" in normalized
-        or "headers" in normalized
-        or "keyring" in normalized
-        or "password" in normalized
-        or "passwd" in normalized
-        or "secret" in normalized
-        or normalized.endswith(
-            ("token", "key", "env", "environment", "envvar", "url", "uri")
-        )
-        or "baseurl" in normalized
-        or "environmentvariable" in normalized
-        or (
-            "endpoint" in normalized
-            and normalized not in _SAFE_ENDPOINT_OPTION_KEYS
-        )
-        or normalized.startswith(
-            (
-                "authentication",
-                "authheader",
-                "authkey",
-                "authref",
-                "authsource",
-                "authtoken",
-                "oauth",
-                "proxy",
-                "tokenenv",
-                "tokenfile",
-                "tokenref",
-                "tokensource",
-            )
-        )
-    ):
-        raise ValueError("adapter option key is reserved")
-    return value
-
-AdapterOptionKey = Annotated[
-    str,
-    AfterValidator(_validate_adapter_option_key),
-]
-AdapterOptionString = Annotated[str, Field(max_length=_MAX_ADAPTER_OPTION_STRING)]
-AdapterOptionInteger = Annotated[
-    int,
-    Field(strict=True, ge=-(2**63), le=2**63 - 1),
-]
-AdapterOptionFloat = Annotated[
-    float,
-    Field(strict=True, ge=-1e100, le=1e100, allow_inf_nan=False),
-]
-AdapterOptionScalar: TypeAlias = (
-    AdapterOptionString | StrictBool | AdapterOptionInteger | AdapterOptionFloat
-)
-AdapterOptionList = Annotated[
-    list[AdapterOptionScalar],
-    Field(max_length=_MAX_ADAPTER_OPTION_ITEMS),
-]
-AdapterOptionValue: TypeAlias = AdapterOptionScalar | AdapterOptionList
 CapabilityMap = Annotated[
     dict[Modality, StrictBool],
     Field(max_length=_MAX_CAPABILITIES),
@@ -162,10 +51,10 @@ JointCapabilities = Annotated[
     list[JointCapability],
     Field(max_length=_MAX_JOINT_CAPABILITIES),
 ]
-AdapterOptions = Annotated[
-    dict[AdapterOptionKey, AdapterOptionValue],
-    Field(max_length=_MAX_ADAPTER_OPTIONS),
-]
+_MAX_INLINE_BYTES = 1_073_741_824
+_MAX_OUTPUT_TOKENS = 1_000_000
+_MAX_REQUEST_TIMEOUT_SECONDS = 3_600
+_MAX_ENDPOINT_PATH_LENGTH = 1_024
 
 
 def _contains_credential_parameter(component: str) -> bool:
@@ -198,6 +87,101 @@ def _is_valid_hostname(hostname: str) -> bool:
     return True
 
 
+class AdapterOptions(BaseModel):
+    """Closed, non-secret v1 adapter tuning options."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    inline_max_bytes: Annotated[
+        int,
+        Field(strict=True, gt=0, le=_MAX_INLINE_BYTES),
+    ] | None = None
+    max_output_tokens: Annotated[
+        int,
+        Field(strict=True, gt=0, le=_MAX_OUTPUT_TOKENS),
+    ] | None = None
+    temperature: Annotated[
+        float,
+        Field(strict=True, ge=0, le=2, allow_inf_nan=False),
+    ] | None = None
+    request_timeout_seconds: Annotated[
+        float,
+        Field(
+            strict=True,
+            gt=0,
+            le=_MAX_REQUEST_TIMEOUT_SECONDS,
+            allow_inf_nan=False,
+        ),
+    ] | None = None
+    endpoint_path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=_MAX_ENDPOINT_PATH_LENGTH,
+    )
+    media_part_mode: Literal[
+        "image_url_data_uri",
+        "input_audio_base64",
+        "video_url_data_uri",
+        "anthropic_base64_media",
+    ] | None = None
+
+    @field_validator("endpoint_path")
+    @classmethod
+    def validate_endpoint_path(cls, value: str | None) -> str | None:
+        """Require a local relative-to-origin path without traversal or URL metadata."""
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            not value.startswith("/")
+            or value.startswith("//")
+            or parsed.scheme
+            or parsed.netloc
+            or parsed.query
+            or parsed.fragment
+            or "\\" in value
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in value
+            )
+        ):
+            raise ValueError("endpoint_path must be a safe relative endpoint path")
+
+        decoded = value
+        for _ in range(len(value)):
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                break
+            decoded = next_decoded
+        decoded_parts = urlsplit(decoded)
+        if (
+            decoded.startswith("//")
+            or decoded_parts.scheme
+            or decoded_parts.netloc
+            or decoded_parts.query
+            or decoded_parts.fragment
+            or "\\" in decoded
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in decoded
+            )
+        ):
+            raise ValueError("endpoint_path must be a safe relative endpoint path")
+        if any(
+            segment.split(";", maxsplit=1)[0] in {".", ".."}
+            for segment in decoded.split("/")
+        ):
+            raise ValueError("endpoint_path must not contain traversal")
+        return value
+
+
+def _adapter_options_are_empty(value: AdapterOptions) -> bool:
+    return all(
+        getattr(value, field_name) is None
+        for field_name in AdapterOptions.model_fields
+    )
+
+
 class ProviderConfig(BaseModel):
     """One provider's non-secret connection settings."""
 
@@ -218,8 +202,8 @@ class ProviderConfig(BaseModel):
         exclude_if=lambda value: not value,
     )
     adapter_options: AdapterOptions = Field(
-        default_factory=dict,
-        exclude_if=lambda value: not value,
+        default_factory=AdapterOptions,
+        exclude_if=_adapter_options_are_empty,
     )
     last_verified_at: datetime | None = None
 
@@ -229,23 +213,6 @@ class ProviderConfig(BaseModel):
         """Keep explicit environment references portable and bounded."""
         if value is not None and _ENVIRONMENT_VARIABLE_NAME.fullmatch(value) is None:
             raise ValueError("api_key_env must be a portable environment variable name")
-        return value
-
-    @field_validator("adapter_options", mode="before")
-    @classmethod
-    def validate_adapter_option_structure(cls, value: object) -> object:
-        """Reject reserved keys and nested mappings before private input can surface."""
-        if not isinstance(value, dict):
-            return value
-        for key, option in value.items():
-            try:
-                _validate_adapter_option_key(key)
-            except (TypeError, ValueError):
-                raise ValueError("adapter option key is invalid") from None
-            if isinstance(option, dict):
-                raise ValueError(  # noqa: TRY004 - Pydantic validation contract
-                    "nested adapter option mappings are not allowed"
-                )
         return value
 
     @field_validator("base_url")

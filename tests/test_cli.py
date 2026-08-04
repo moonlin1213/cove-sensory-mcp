@@ -504,6 +504,50 @@ def test_status_reports_credential_presence_without_values_or_references(
     assert str(len(secret)) not in captured
 
 
+def test_status_rejects_invalid_provider_identifier_without_echo(
+    tmp_services: AppServices,
+) -> None:
+    """Printing a rejected provider-map key would expose untrusted multiline config data."""
+    private_identifier = "private\nprovider"
+    tmp_services.config_store.path.write_text(
+        "version: 1\nproviders:\n  ? |\n    private\n    provider\n  :\n"
+        "    adapter: gemini\n"
+        "    model: gemini-test\n"
+        "    credential_ref: private-reference\n",
+        encoding="utf-8",
+    )
+    messages: list[str] = []
+
+    assert run_status(tmp_services, output=messages.append) == 1
+
+    report = "\n".join(messages)
+    assert report == "Configuration: invalid\nFoundation provider perception: unavailable"
+    assert private_identifier not in report
+
+
+def test_doctor_rejects_invalid_provider_identifier_without_echo(
+    tmp_services: AppServices, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Doctor must bound invalid config diagnostics before iterating printable provider IDs."""
+    private_identifier = "private/provider"
+    tmp_services.config_store.path.write_text(
+        "version: 1\nproviders:\n"
+        f"  {private_identifier}:\n"
+        "    adapter: gemini\n"
+        "    model: gemini-test\n"
+        "    credential_ref: private-reference\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda executable: None)
+    messages: list[str] = []
+
+    assert run_doctor(tmp_services, output=messages.append) == 1
+
+    report = "\n".join(messages)
+    assert "Config: invalid" in report
+    assert private_identifier not in report
+
+
 def test_doctor_reports_missing_media_runtime_without_crashing(
     tmp_services: AppServices, monkeypatch: pytest.MonkeyPatch
 ) -> None:

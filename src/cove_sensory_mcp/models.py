@@ -3,8 +3,26 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+
+_MAX_PROVIDER_ID_LENGTH = 64
+
+
+def _validate_provider_id(value: str) -> str:
+    """Accept one printable, bounded identifier without narrowing Unicode names."""
+    if (
+        not value
+        or len(value) > _MAX_PROVIDER_ID_LENGTH
+        or not value[0].isalnum()
+        or any(not (character.isalnum() or character in "._-") for character in value)
+    ):
+        raise ValueError("provider identifier is invalid")
+    return value
+
+
+ProviderId = Annotated[str, AfterValidator(_validate_provider_id)]
 
 
 class Modality(str, Enum):
@@ -54,7 +72,7 @@ class ProviderRef(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: str = Field(min_length=1)
+    provider: ProviderId
     authorized: bool = False
 
 
@@ -63,7 +81,7 @@ class RouteConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    primary: str = Field(min_length=1)
+    primary: ProviderId
     fallbacks: list[ProviderRef] = Field(default_factory=list)
 
 

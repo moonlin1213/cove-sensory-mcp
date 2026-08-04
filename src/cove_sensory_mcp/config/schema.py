@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Literal
 from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cove_sensory_mcp.models import Modality, RouteConfig
+from cove_sensory_mcp.models import Modality, ProviderId, RouteConfig
 
 _CREDENTIAL_PARAMETER_NAMES = frozenset(
     {
@@ -37,6 +38,27 @@ def _contains_credential_parameter(component: str) -> bool:
     )
 
 
+def _is_valid_hostname(hostname: str) -> bool:
+    """Validate an IP literal or an IDNA-compatible DNS hostname."""
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii").rstrip(".")
+        except UnicodeError:
+            return False
+        labels = ascii_hostname.split(".")
+        return bool(ascii_hostname) and len(ascii_hostname) <= 253 and all(
+            label
+            and len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in label)
+            for label in labels
+        )
+    return True
+
+
 class ProviderConfig(BaseModel):
     """One provider's non-secret connection settings."""
 
@@ -51,14 +73,16 @@ class ProviderConfig(BaseModel):
 
     @field_validator("base_url")
     @classmethod
-    def validate_base_url_has_no_credentials(cls, value: str | None) -> str | None:
-        """Prevent endpoint URLs from becoming an alternate credential store."""
+    def validate_base_url(cls, value: str | None) -> str | None:
+        """Require a credential-free HTTPS endpoint with one valid host and port."""
         if value is None:
             return value
         try:
             parsed = urlsplit(value)
+            hostname = parsed.hostname
+            _ = parsed.port
         except ValueError as exc:
-            raise ValueError("base_url must be a valid endpoint URL") from exc
+            raise ValueError("base_url must be a valid HTTPS endpoint") from exc
         if (
             parsed.username is not None
             or parsed.password is not None
@@ -66,7 +90,21 @@ class ProviderConfig(BaseModel):
             or _contains_credential_parameter(parsed.fragment)
         ):
             raise ValueError("base_url must not contain credentials")
-        return value
+        authority = parsed.netloc.rsplit("@", maxsplit=1)[-1]
+        if (
+            parsed.scheme != "https"
+            or hostname is None
+            or not _is_valid_hostname(hostname)
+            or authority.endswith(":")
+            or parsed.query
+            or parsed.fragment
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in value
+            )
+        ):
+            raise ValueError("base_url must be a valid HTTPS endpoint")
+        return value.rstrip("/")
 
     @model_validator(mode="after")
     def validate_credential_reference(self) -> ProviderConfig:
@@ -102,7 +140,7 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: Literal[1] = 1
-    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
+    providers: dict[ProviderId, ProviderConfig] = Field(default_factory=dict)
     routes: RoutesConfig = Field(default_factory=RoutesConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     allowed_media_roots: list[str] = Field(default_factory=list)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig, RoutesConfig
@@ -112,6 +113,178 @@ def test_provider_schema_rejects_plaintext_api_key() -> None:
     """Adding a plaintext api_key field must fail instead of widening the credential boundary."""
     with pytest.raises(ValidationError):
         ProviderConfig(adapter="gemini", model="gemini-test", api_key="test-secret-never-persisted")
+
+
+@pytest.mark.parametrize(
+    "provider_id",
+    [
+        pytest.param("", id="blank"),
+        pytest.param("   ", id="whitespace"),
+        pytest.param("private\nprovider", id="multiline"),
+        pytest.param("private\x00provider", id="control-character"),
+        pytest.param("private/provider", id="invalid-character"),
+        pytest.param("p" * 65, id="oversized"),
+    ],
+)
+def test_load_rejects_invalid_provider_map_identifier_without_echo(
+    tmp_path: Path, provider_id: str
+) -> None:
+    """Weakening provider-map key validation could expose unsafe identifiers in CLI output."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "providers": {
+                    provider_id: {
+                        "adapter": "gemini",
+                        "model": "gemini-test",
+                        "credential_ref": "private-reference",
+                    }
+                },
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SensoryError) as exc_info:
+        ConfigStore(path).load()
+
+    assert exc_info.value.code is ErrorCode.CONFIG_INVALID
+    assert str(exc_info.value) == "The configuration file is invalid."
+    if provider_id:
+        assert provider_id not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("route", "private_identifier"),
+    [
+        pytest.param(
+            {"primary": "private/provider", "fallbacks": []},
+            "private/provider",
+            id="primary",
+        ),
+        pytest.param(
+            {
+                "primary": "gemini",
+                "fallbacks": [
+                    {"provider": "private\nprovider", "authorized": True}
+                ],
+            },
+            "private\nprovider",
+            id="fallback",
+        ),
+    ],
+)
+def test_load_rejects_invalid_route_provider_identifier_without_echo(
+    tmp_path: Path, route: dict[str, object], private_identifier: str
+) -> None:
+    """Bypassing the shared identifier type in routes could reintroduce printable raw keys."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "providers": {
+                    "gemini": {
+                        "adapter": "gemini",
+                        "model": "gemini-test",
+                        "credential_ref": "private-reference",
+                    }
+                },
+                "routes": {"image": route},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SensoryError) as exc_info:
+        ConfigStore(path).load()
+
+    assert exc_info.value.code is ErrorCode.CONFIG_INVALID
+    assert str(exc_info.value) == "The configuration file is invalid."
+    assert private_identifier not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        pytest.param("not-a-url", id="non-url"),
+        pytest.param("http://api.example.test/v1", id="non-https"),
+        pytest.param("https:///v1", id="missing-hostname"),
+        pytest.param("https://api.example.test:not-a-port/v1", id="malformed-port"),
+        pytest.param("https://api.example.test:70000/v1", id="out-of-range-port"),
+        pytest.param("https://user@api.example.test/v1", id="userinfo"),
+        pytest.param("https://api.example.test/v1?mode=fast", id="query"),
+        pytest.param("https://api.example.test/v1#regional", id="fragment"),
+    ],
+)
+def test_load_rejects_invalid_provider_endpoint_without_echo(
+    tmp_path: Path, base_url: str
+) -> None:
+    """Loading an endpoint outside the HTTPS origin contract could misroute later media."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "providers": {
+                    "custom": {
+                        "adapter": "openai-compatible",
+                        "base_url": base_url,
+                        "model": "vision-1",
+                        "credential_ref": "custom-main",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SensoryError) as exc_info:
+        ConfigStore(path).load()
+
+    assert exc_info.value.code is ErrorCode.CONFIG_INVALID
+    assert str(exc_info.value) == "The configuration file is invalid."
+    assert base_url not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        pytest.param(
+            {
+                "adapter": "gemini",
+                "model": "gemini-test",
+                "credential_ref": "gemini-main",
+            },
+            id="built-in-without-endpoint",
+        ),
+        pytest.param(
+            {
+                "adapter": "openai-compatible",
+                "base_url": "https://api.example.test:8443/v1",
+                "model": "vision-1",
+                "credential_ref": "custom-main",
+            },
+            id="custom-https-endpoint",
+        ),
+    ],
+)
+def test_load_accepts_provider_with_valid_endpoint_contract(
+    tmp_path: Path, provider: dict[str, object]
+) -> None:
+    """Overtightening the endpoint invariant could reject built-ins or valid custom origins."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump({"version": 1, "providers": {"provider-one": provider}}),
+        encoding="utf-8",
+    )
+
+    loaded = ConfigStore(path).load()
+
+    assert loaded.providers["provider-one"].base_url == provider.get("base_url")
 
 
 @pytest.mark.parametrize(

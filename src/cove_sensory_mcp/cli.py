@@ -6,12 +6,12 @@ import getpass
 import json
 import os
 import platform
-import re
 import shutil
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from urllib.parse import urlsplit
+
+from pydantic import TypeAdapter
 
 from . import __version__
 from .config.paths import AppPaths
@@ -19,7 +19,7 @@ from .config.schema import AppConfig, ProviderConfig
 from .config.secrets import KeyringSecretStore
 from .config.store import ConfigStore
 from .errors import SensoryError
-from .models import Modality
+from .models import Modality, ProviderId
 from .server import run_stdio
 from .services import AppServices
 from .tools.setup import sensory_self_test
@@ -31,7 +31,7 @@ _MINIMAX_BASE_URLS = {
     "cn": "https://api.minimaxi.com/v1",
     "global": "https://api.minimax.io/v1",
 }
-_SAFE_PROVIDER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_PROVIDER_ID_ADAPTER = TypeAdapter(ProviderId)
 _CANCEL_VALUES = frozenset({"cancel", "quit", "q"})
 
 
@@ -69,34 +69,13 @@ def _is_cancelled(value: str) -> bool:
 
 
 def _validated_identifier(value: str) -> str:
-    if _SAFE_PROVIDER_ID.fullmatch(value) is None:
-        raise ValueError("invalid identifier")
-    return value
+    return _PROVIDER_ID_ADAPTER.validate_python(value)
 
 
 def _validated_model(value: str) -> str:
     if not value or "\n" in value or "\r" in value:
         raise ValueError("invalid model")
     return value
-
-
-def _validated_base_url(value: str) -> str:
-    try:
-        parsed = urlsplit(value)
-        hostname = parsed.hostname
-        _port = parsed.port
-    except ValueError:
-        raise ValueError("invalid endpoint") from None
-    if (
-        parsed.scheme != "https"
-        or hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("invalid endpoint")
-    return value.rstrip("/")
 
 
 def _declared_capabilities(value: str) -> dict[Modality, bool]:
@@ -125,7 +104,7 @@ def _provider_from_answers(
         credential_ref = _clean_answer(input_fn, "Credential reference: ")
         region = _clean_answer(input_fn, "MiniMax region [cn/global/custom]: ").lower()
         if region == "custom":
-            base_url = _validated_base_url(_clean_answer(input_fn, "MiniMax base URL: "))
+            base_url = _clean_answer(input_fn, "MiniMax base URL: ")
         elif region in _MINIMAX_BASE_URLS:
             base_url = _MINIMAX_BASE_URLS[region]
         else:
@@ -142,7 +121,7 @@ def _provider_from_answers(
     if provider_choice == "custom":
         provider_id = _validated_identifier(_clean_answer(input_fn, "Provider identifier: "))
         credential_ref = _clean_answer(input_fn, "Credential reference: ")
-        base_url = _validated_base_url(_clean_answer(input_fn, "HTTPS base URL: "))
+        base_url = _clean_answer(input_fn, "HTTPS base URL: ")
         model = _validated_model(_clean_answer(input_fn, "Model: "))
         declared = _declared_capabilities(
             _clean_answer(

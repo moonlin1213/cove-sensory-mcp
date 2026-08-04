@@ -3,22 +3,69 @@
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import parse_qsl, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cove_sensory_mcp.models import RouteConfig
+
+_CREDENTIAL_PARAMETER_NAMES = frozenset(
+    {
+        "apikey",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "secret",
+        "clientsecret",
+        "credential",
+        "password",
+        "passwd",
+        "authorization",
+        "auth",
+        "key",
+    }
+)
+
+
+def _contains_credential_parameter(component: str) -> bool:
+    """Return whether a URL query or fragment names a credential value."""
+    return any(
+        "".join(character for character in name.lower() if character.isalnum())
+        in _CREDENTIAL_PARAMETER_NAMES
+        for name, _ in parse_qsl(component, keep_blank_values=True)
+    )
 
 
 class ProviderConfig(BaseModel):
     """One provider's non-secret connection settings."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     adapter: str = Field(min_length=1)
     base_url: str | None = None
     model: str = Field(min_length=1)
     credential_ref: str | None = Field(default=None, min_length=1)
     api_key_env: str | None = Field(default=None, min_length=1)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url_has_no_credentials(cls, value: str | None) -> str | None:
+        """Prevent endpoint URLs from becoming an alternate credential store."""
+        if value is None:
+            return value
+        try:
+            parsed = urlsplit(value)
+        except ValueError as exc:
+            raise ValueError("base_url must be a valid endpoint URL") from exc
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or _contains_credential_parameter(parsed.query)
+            or _contains_credential_parameter(parsed.fragment)
+        ):
+            raise ValueError("base_url must not contain credentials")
+        return value
 
     @model_validator(mode="after")
     def validate_credential_reference(self) -> ProviderConfig:

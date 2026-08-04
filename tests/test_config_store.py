@@ -112,3 +112,36 @@ def test_provider_schema_rejects_plaintext_api_key() -> None:
     """Adding a plaintext api_key field must fail instead of widening the credential boundary."""
     with pytest.raises(ValidationError):
         ProviderConfig(adapter="gemini", model="gemini-test", api_key="test-secret-never-persisted")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://test-user:test-secret-never-persisted@example.test/v1",
+        "https://example.test/v1?api_key=test-secret-never-persisted",
+        "https://example.test/v1#access_token=test-secret-never-persisted",
+    ],
+)
+def test_provider_schema_rejects_secret_bearing_base_url_before_save(
+    tmp_path: Path, base_url: str
+) -> None:
+    """Removing endpoint credential checks must not let secrets reach the config file."""
+    path = tmp_path / "config.yaml"
+
+    with pytest.raises(ValidationError) as exc_info:
+        ConfigStore(path).save(
+            AppConfig(
+                providers={
+                    "custom": ProviderConfig(
+                        adapter="openai-compatible",
+                        base_url=base_url,
+                        model="vision-1",
+                        credential_ref="custom-main",
+                    )
+                }
+            )
+        )
+
+    assert "base_url must not contain credentials" in str(exc_info.value)
+    assert base_url not in str(exc_info.value)
+    assert not path.exists()

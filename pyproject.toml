@@ -23,6 +23,7 @@ dependencies = [
   "PyYAML>=6.0",
   "platformdirs>=4.2",
   "keyring>=25.0",
+  "google-genai>=2.12,<3",
 ]
 
 [project.scripts]

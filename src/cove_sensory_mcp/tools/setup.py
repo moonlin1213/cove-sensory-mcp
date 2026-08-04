@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from typing import Protocol
 
 from cove_sensory_mcp import __version__
-from cove_sensory_mcp.errors import SensoryError, error_result
+from cove_sensory_mcp.errors import ErrorCode, SensoryError, error_result
 from cove_sensory_mcp.models import CapabilityStatus, Modality, SensoryStatus
-from cove_sensory_mcp.services import AppServices, SelfTestVerifier
+from cove_sensory_mcp.services import AppServices
 
 _SETUP_COMMAND = "cove-sensory-mcp configure"
 _NOT_VERIFIED_REASON = "No verified provider is configured."
@@ -37,6 +39,41 @@ _PROVIDER_OPTIONS: list[dict[str, object]] = [
         ],
     },
 ]
+
+
+class SelfTestVerifier(Protocol):
+    """Produce a public self-test result for requested modalities."""
+
+    async def verify(self, modalities: list[Modality]) -> dict[str, object]:
+        """Return a JSON-compatible verification result without private data."""
+
+
+class FoundationSelfTestVerifier:
+    """Honest placeholder used until a provider verification implementation exists."""
+
+    async def verify(self, modalities: list[Modality]) -> dict[str, object]:
+        """Report that no provider capability has been verified, without I/O."""
+        del modalities
+        return error_result(
+            SensoryError(
+                ErrorCode.SETUP_REQUIRED,
+                _NOT_VERIFIED_REASON,
+                setup_command=_SETUP_COMMAND,
+            )
+        )
+
+
+def _public_result(result: dict[str, object]) -> dict[str, object]:
+    """Validate and copy a verifier result before exposing it to an MCP client."""
+    try:
+        copied = json.loads(json.dumps(result, allow_nan=False))
+    except (TypeError, ValueError):
+        return error_result(
+            SensoryError(ErrorCode.CONFIG_INVALID, "The self-test result is invalid.")
+        )
+    if not isinstance(copied, dict):
+        return error_result(SensoryError(ErrorCode.CONFIG_INVALID, "The self-test result is invalid."))
+    return copied
 
 
 def _foundation_status() -> SensoryStatus:
@@ -85,4 +122,6 @@ async def sensory_self_test(
     verifier: SelfTestVerifier | None = None,
 ) -> dict[str, object]:
     """Delegate a requested self-test to an injected verifier implementation."""
-    return await (verifier or services.self_test_verifier).verify(modalities)
+    del services
+    active_verifier = verifier if verifier is not None else FoundationSelfTestVerifier()
+    return _public_result(await active_verifier.verify(modalities))

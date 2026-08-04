@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+from dataclasses import fields
 
 import pytest
 
@@ -24,6 +25,14 @@ def services(tmp_path) -> AppServices:
         config_store=ConfigStore(tmp_path / "config.yaml"),
         secret_store=MemorySecretStore(),
     )
+
+
+def test_app_services_keeps_only_config_and_secret_boundaries() -> None:
+    """Adding provider runtime state here would change the foundation composition contract."""
+    assert [service_field.name for service_field in fields(AppServices)] == [
+        "config_store",
+        "secret_store",
+    ]
 
 
 @pytest.mark.asyncio
@@ -126,3 +135,54 @@ async def test_self_test_returns_the_injected_verifiers_public_result(
 
     assert result == {"status": "ok", "verified": ["video_visual"]}
     assert verifier.modalities == [Modality.VIDEO_VISUAL]
+
+
+class ReusedResultVerifier:
+    """A verifier that intentionally returns one object for every call."""
+
+    def __init__(self) -> None:
+        self.result: dict[str, object] = {"status": "ok", "verified": ["image"]}
+
+    async def verify(self, modalities: list[Modality]) -> dict[str, object]:
+        del modalities
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_self_test_returns_an_isolated_copy_of_a_reused_verifier_result(
+    services: AppServices,
+) -> None:
+    """Returning a verifier's dict directly would let callers corrupt later responses."""
+    verifier = ReusedResultVerifier()
+    first = await sensory_self_test(services, [Modality.IMAGE], verifier=verifier)
+    first["verified"].append("incorrect mutation")
+
+    second = await sensory_self_test(services, [Modality.IMAGE], verifier=verifier)
+
+    assert second == {"status": "ok", "verified": ["image"]}
+    assert verifier.result == {"status": "ok", "verified": ["image"]}
+
+
+class InvalidResultVerifier:
+    """A verifier returning a non-JSON value must not escape through the public tool."""
+
+    async def verify(self, modalities: list[Modality]) -> dict[str, object]:
+        del modalities
+        return {"status": "ok", "unsafe": object()}
+
+
+@pytest.mark.asyncio
+async def test_self_test_replaces_non_json_verifier_output_with_a_public_error(
+    services: AppServices,
+) -> None:
+    """Serializing arbitrary verifier objects could reveal implementation details."""
+    result = await sensory_self_test(services, [Modality.IMAGE], verifier=InvalidResultVerifier())
+
+    assert result == {
+        "status": "error",
+        "error": {
+            "code": "CONFIG_INVALID",
+            "message": "The self-test result is invalid.",
+            "retryable": False,
+        },
+    }

@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import shutil
+import sys
 import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Literal, cast
 from pydantic import TypeAdapter
 
 from . import __version__
+from .client_config import CLIENTS, render_client_config
 from .config.paths import AppPaths
 from .config.schema import AdapterOptions, AppConfig, ProviderConfig
 from .config.secrets import KeyringSecretStore
@@ -652,6 +654,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Confirm Provider quota use without an interactive prompt.",
     )
+    print_config_parser = subparsers.add_parser(
+        "print-config", help="Print a secret-free local stdio MCP client configuration."
+    )
+    print_config_parser.add_argument("--client", choices=CLIENTS, required=True)
+    print_config_parser.add_argument(
+        "--executable",
+        type=Path,
+        default=None,
+        help="Override the installed executable path shown in the configuration.",
+    )
     args = parser.parse_args(argv)
     if args.version:
         print(f"cove-sensory-mcp {__version__}")
@@ -679,6 +691,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             input_fn=input,
             yes=args.yes,
         )
+    if args.command == "print-config":
+        executable = args.executable or Path(sys.argv[0])
+        print(render_client_config(args.client, executable), end="")
+        return 0
     parser.print_help()
     return 0
 

@@ -153,6 +153,14 @@ def test_main_self_test_yes_reaches_noninteractive_runner(
     assert captured["yes"] is True
 
 
+def test_main_print_config_emits_stdio_command(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["print-config", "--client", "generic", "--executable", "/opt/cove"]) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["mcpServers"]["cove-sensory"] == {
+        "command": "/opt/cove", "args": ["serve"]
+    }
+
+
 def test_configure_eye_and_ear_steps_write_only_capabilities_verified_in_batch(
     tmp_services: AppServices,
 ) -> None:

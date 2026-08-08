@@ -26,6 +26,7 @@ dependencies = [
   "keyring>=25.0",
   "google-genai>=2.12,<3",
   "httpx>=0.28,<1",
+  "Pillow>=10.4,<13",
 ]
 
 [project.scripts]

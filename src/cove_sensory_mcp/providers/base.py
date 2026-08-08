@@ -28,6 +28,8 @@ class PreparedMedia:
     mime_type: str
     media_kind: MediaKind
     duration_seconds: float | None
+    is_animated: bool = False
+    sequence_index: int = 0
 
     def __post_init__(self) -> None:
         if not self.mime_type or len(self.mime_type) > 255:
@@ -38,6 +40,8 @@ class PreparedMedia:
             or self.duration_seconds < 0
         ):
             raise ValueError("duration_seconds must be finite and non-negative")
+        if isinstance(self.sequence_index, bool) or self.sequence_index < 0:
+            raise ValueError("sequence_index must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
@@ -100,3 +101,74 @@ class ProviderObservationBatch(BaseModel):
     def by_modality(self) -> dict[Modality, ObservationEnvelope]:
         """Return the unique observations indexed by their modality."""
         return {observation.modality: observation for observation in self.observations}
+
+
+class ProviderUsage(BaseModel):
+    """Actual Provider identity disclosed by a public sensory result."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    provider_id: str = Field(min_length=1, max_length=64)
+    model: str = Field(min_length=1, max_length=256)
+    fallback_used: bool = False
+
+
+class Coverage(BaseModel):
+    """Truthful visual and auditory coverage for a sensory result."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    visual: bool = False
+    audio: bool = False
+    visual_provider: str | None = None
+    audio_provider: str | None = None
+
+
+class TimelineEvidence(BaseModel):
+    """Deterministically aligned evidence from overlapping source intervals."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    start_seconds: Timestamp
+    end_seconds: Timestamp
+    visual: list[str] = Field(default_factory=list, max_length=_MAX_SEGMENTS)
+    audio: list[str] = Field(default_factory=list, max_length=_MAX_SEGMENTS)
+    transcript: list[str] = Field(default_factory=list, max_length=_MAX_SEGMENTS)
+
+
+class SensoryToolResult(BaseModel):
+    """Common public result returned by all four production sensing tools."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    schema_version: Literal["1.0"] = "1.0"
+    request_id: str = Field(default_factory=lambda: f"sense_{uuid4().hex}")
+    modality: Literal["image", "video", "audio", "music"]
+    status: Literal["completed", "partial", "error"]
+    coverage: Coverage = Field(default_factory=Coverage)
+    summary: str = Field(max_length=_MAX_SUMMARY_LENGTH)
+    warnings: list[str] = Field(default_factory=list, max_length=_MAX_WARNINGS)
+    providers: list[ProviderUsage] = Field(default_factory=list, max_length=5)
+    requested_start_seconds: Timestamp | None = None
+    requested_end_seconds: Timestamp | None = None
+    segments: list[ObservationSegment] = Field(default_factory=list, max_length=_MAX_SEGMENTS)
+    transcript: list[TranscriptSegment] = Field(default_factory=list, max_length=_MAX_SEGMENTS)
+
+
+class ImageSensoryReport(SensoryToolResult):
+    modality: Literal["image"] = "image"
+
+
+class AudioSensoryReport(SensoryToolResult):
+    modality: Literal["audio"] = "audio"
+
+
+class MusicSensoryReport(SensoryToolResult):
+    modality: Literal["music"] = "music"
+
+
+class VideoSensoryReport(SensoryToolResult):
+    modality: Literal["video"] = "video"
+    visual_summary: str = Field(default="", max_length=_MAX_SUMMARY_LENGTH)
+    audio_summary: str = Field(default="", max_length=_MAX_SUMMARY_LENGTH)
+    timeline: list[TimelineEvidence] = Field(default_factory=list, max_length=500)

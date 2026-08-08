@@ -1,2 +1,5 @@
 Cove Sensory MCP
 Copyright 2026 Cove Sensory MCP contributors
+
+This product may interoperate with FFmpeg, which is not part of this Apache-2.0 work.
+See THIRD_PARTY_NOTICES.md.

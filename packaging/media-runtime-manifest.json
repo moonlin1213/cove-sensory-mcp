@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "note": "No FFmpeg binary is bundled. Entries remain disabled until an exact distributor archive is reviewed and hashed in native release CI.",
+  "targets": {
+    "macos-arm64": {"status": "provenance-pending"},
+    "macos-x64": {"status": "provenance-pending"},
+    "windows-x64": {"status": "provenance-pending"}
+  }
+}

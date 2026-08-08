@@ -1,0 +1,67 @@
+{
+  "assets": [
+    {
+      "expected_keyword_groups": [
+        [
+          "blue",
+          "circle"
+        ],
+        [
+          "COVE",
+          "3"
+        ]
+      ],
+      "license": "Apache-2.0",
+      "mime_type": "image/png",
+      "modality": "image",
+      "name": "shape.png",
+      "sha256": "e7d9bfd5eb99e43f6d6dcda16eed3eff557c6a0723e36de2765334fa90480a53"
+    },
+    {
+      "expected_keyword_groups": [
+        [
+          "blue",
+          "circle",
+          "left",
+          "right"
+        ],
+        [
+          "3"
+        ]
+      ],
+      "license": "Apache-2.0",
+      "mime_type": "video/mp4",
+      "modality": "video_visual",
+      "name": "motion.mp4",
+      "sha256": "166c6a1ed6c88346ffa6d638a5a92dd555ee45c46468f956cac8f3aacbc43ce3"
+    },
+    {
+      "expected_keyword_groups": [
+        [
+          "tone",
+          "880"
+        ]
+      ],
+      "license": "Apache-2.0",
+      "mime_type": "audio/wav",
+      "modality": "audio",
+      "name": "speech.wav",
+      "sha256": "d94b00d6b71f669b70f42386468cd6d86fb6367bb46ad8c9fae07b1888337aa2"
+    },
+    {
+      "expected_keyword_groups": [
+        [
+          "tone",
+          "rhythm",
+          "change"
+        ]
+      ],
+      "license": "Apache-2.0",
+      "mime_type": "audio/wav",
+      "modality": "music",
+      "name": "music.wav",
+      "sha256": "29a2075f03371898f478d8486e25c8e5f1687c818f9e6fd4512eabcd2f2e1378"
+    }
+  ],
+  "schema_version": 1
+}

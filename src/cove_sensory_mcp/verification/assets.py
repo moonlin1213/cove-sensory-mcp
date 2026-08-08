@@ -38,9 +38,9 @@ class SelfTestAssetStore:
     @classmethod
     def packaged(cls) -> SelfTestAssetStore:
         """Describe the stable package locations supplied by the media/release milestone."""
-        root = Path(__file__).resolve().parent / "self_test_media"
+        root = Path(__file__).resolve().parents[1] / "assets" / "self_test"
         video = root / "motion.mp4"
-        audio = root / "tones.wav"
+        audio = root / "speech.wav"
         return cls(
             {
                 Modality.IMAGE: PreparedMedia(
@@ -68,10 +68,10 @@ class SelfTestAssetStore:
                     2.0,
                 ),
                 Modality.MUSIC: PreparedMedia(
-                    root / "scale.wav",
+                    root / "music.wav",
                     "audio/wav",
                     MediaKind.AUDIO,
-                    2.0,
+                    3.0,
                 ),
             },
             trusted_root=root,

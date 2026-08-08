@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -17,17 +16,14 @@ def _executable(path: Path, body: str) -> Path:
     return path
 
 
-def _discovery_executable(path: Path) -> Path:
-    if os.name == "nt":
-        executable = path.with_suffix(".exe")
-        shutil.copy2(sys.executable, executable)
-        return executable
-    return _executable(path, "echo ok\n")
-
-
 def test_runtime_discovery_prefers_bundled_then_configured(tmp_path: Path) -> None:
-    bundled = _discovery_executable(tmp_path / "ffmpeg-bundled")
-    configured = _discovery_executable(tmp_path / "ffmpeg-configured")
+    if os.name == "nt":
+        bundled = Path(sys.executable)
+        configured = tmp_path / "unused-configured.exe"
+        configured.write_bytes(b"not reached")
+    else:
+        bundled = _executable(tmp_path / "ffmpeg-bundled", "echo ok\n")
+        configured = _executable(tmp_path / "ffmpeg-configured", "echo ok\n")
     runtime = MediaRuntime.discover(bundled, configured, "")
     assert runtime.ffmpeg_path == bundled
 
@@ -43,7 +39,11 @@ async def test_process_arguments_preserve_spaces_and_non_ascii(tmp_path: Path) -
     binary = Path(sys.executable)
     runtime = MediaRuntime(binary, binary)
     result = await runtime.run_ffmpeg(
-        ["-c", "import sys; print(sys.argv[1], end='')", "路径 with spaces"],
+        [
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.argv[1].encode('utf-8'))",
+            "路径 with spaces",
+        ],
         timeout=2,
     )
     assert result.returncode == 0

@@ -29,7 +29,15 @@ def native_platform_tag() -> str:
 
 def _files(source: Path) -> list[Path]:
     forbidden = {".env", ".git", "config.yaml", "credentials", "cache"}
-    files = [path for path in source.rglob("*") if path.is_file()]
+    files = [
+        path
+        for path in source.rglob("*")
+        if path.is_file()
+        and not (
+            "sboms" in path.relative_to(source).parts
+            and ".dist-info" in "/".join(path.relative_to(source).parts)
+        )
+    ]
     if any(forbidden.intersection(path.parts) for path in files):
         raise ValueError("standalone tree contains local or development data")
     return sorted(files, key=lambda item: item.relative_to(source).as_posix())

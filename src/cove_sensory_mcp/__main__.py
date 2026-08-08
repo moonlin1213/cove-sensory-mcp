@@ -1,3 +1,3 @@
-from .cli import entrypoint
+from cove_sensory_mcp.cli import entrypoint
 
 entrypoint()

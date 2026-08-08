@@ -1,17 +1,25 @@
 # PyInstaller onedir specification. Build only in a clean native platform job.
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
+
+project_root = Path(SPECPATH).parent
 
 datas = (
     collect_data_files("cove_sensory_mcp", includes=["assets/self_test/*"])
     + copy_metadata("mcp")
     + copy_metadata("keyring")
-    + [("LICENSE", "."), ("NOTICE", "."), ("THIRD_PARTY_NOTICES.md", ".")]
+    + [
+        (str(project_root / "LICENSE"), "."),
+        (str(project_root / "NOTICE"), "."),
+        (str(project_root / "THIRD_PARTY_NOTICES.md"), "."),
+    ]
 )
 hiddenimports = collect_submodules("keyring.backends")
 
 analysis = Analysis(
-    ["src/cove_sensory_mcp/__main__.py"],
-    pathex=["src"],
+    [str(project_root / "src/cove_sensory_mcp/__main__.py")],
+    pathex=[str(project_root / "src")],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

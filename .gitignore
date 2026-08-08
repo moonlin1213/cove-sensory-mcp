@@ -6,5 +6,6 @@ __pycache__/
 .ruff_cache/
 .uv-cache/
 .venv/
+.pyinstaller-cache/
 build/
 dist/

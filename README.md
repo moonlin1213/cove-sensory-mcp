@@ -11,6 +11,11 @@ Python 3.11+ users can install with `uvx` or `pipx`. Standalone macOS (Apple Sil
 Intel) and Windows x64 archives are produced by release CI; the installers stay inside
 the current user account and never require administrator rights.
 
+The `0.1.0` release candidate is not public yet. Standalone archives must be treated as
+unsigned unless the downloaded draft's native CI evidence explicitly confirms signing
+(and, on macOS, notarization). The current local acceptance run does not substitute for
+the three native CI jobs or clean-account installation journeys.
+
 ```console
 uvx cove-sensory-mcp doctor
 uvx cove-sensory-mcp print-config --client generic

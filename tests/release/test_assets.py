@@ -12,7 +12,6 @@ from PIL import Image
 from cove_sensory_mcp.models import Modality
 from cove_sensory_mcp.verification.assets import SelfTestAssetStore
 
-
 ROOT = Path(__file__).parents[2]
 ASSETS = ROOT / "src/cove_sensory_mcp/assets/self_test"
 

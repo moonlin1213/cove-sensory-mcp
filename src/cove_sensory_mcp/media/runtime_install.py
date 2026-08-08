@@ -128,10 +128,10 @@ def _safe_extract(archive: Path, destination: Path) -> None:
             source.extractall(destination)
         return
     with tarfile.open(archive, "r:*") as source:
-        members = source.getmembers()
-        if any(not (item.isfile() or item.isdir()) for item in members):
+        tar_members = source.getmembers()
+        if any(not (item.isfile() or item.isdir()) for item in tar_members):
             raise ValueError("runtime archive contains links or special entries")
-        _validate_names([item.name for item in members])
+        _validate_names([item.name for item in tar_members])
         source.extractall(destination, filter="data")
 
 

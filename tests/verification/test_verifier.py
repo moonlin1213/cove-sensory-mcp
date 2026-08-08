@@ -264,6 +264,125 @@ async def test_image_facts_require_an_affirmative_presence_event(
     assert result[0].verified is False
 
 
+@pytest.mark.parametrize(
+    ("modality", "summary"),
+    [
+        (
+            Modality.VIDEO_VISUAL,
+            "A red ball moves left rather than right.",
+        ),
+        (
+            Modality.VIDEO_VISUAL,
+            "A red ball moves left instead of right.",
+        ),
+        (
+            Modality.VIDEO_VISUAL,
+            "A red ball moves left other than right.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chimes once rather than twice.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chime twice.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell ring twice.",
+        ),
+        (
+            Modality.AUDIO,
+            "A tone beeps twice rather than three times.",
+        ),
+        (
+            Modality.AUDIO,
+            "A tone sound three times.",
+        ),
+        (
+            Modality.MUSIC,
+            "A piano plays descending rather than ascending.",
+        ),
+        (
+            Modality.IMAGE,
+            "The statement that a blue triangle is visible is false.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chimes twice? No.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chimes twice, but it is not heard.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chimes twice is not heard.",
+        ),
+        (
+            Modality.AUDIO,
+            "A tone beeps three times, but it is not heard.",
+        ),
+        (
+            Modality.AUDIO,
+            "A tone beeps three times is not heard.",
+        ),
+        (
+            Modality.MUSIC,
+            "A piano plays an ascending scale, but it is not heard.",
+        ),
+        (
+            Modality.MUSIC,
+            "A piano plays an ascending scale is not heard.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_contrasts_questions_and_postposed_denials_do_not_verify(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    summary: str,
+) -> None:
+    store = _configured_store(tmp_path)
+
+    result = await _verifier(
+        store,
+        SemanticProvider({modality: summary}),
+        assets,
+    ).verify("vision", [modality])
+
+    assert result[0].verified is False
+
+
+@pytest.mark.parametrize(
+    ("modality", "summary"),
+    [
+        (Modality.IMAGE, "A blue triangle is visible."),
+        (Modality.VIDEO_VISUAL, "A red ball moves to the right."),
+        (Modality.VIDEO_AUDIO, "A bell chimes twice."),
+        (Modality.AUDIO, "A tone beeps three times."),
+        (Modality.MUSIC, "A piano plays an ascending scale."),
+    ],
+)
+@pytest.mark.asyncio
+async def test_each_modality_preserves_its_complete_affirmative_fixture_event(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    summary: str,
+) -> None:
+    store = _configured_store(tmp_path)
+
+    result = await _verifier(
+        store,
+        SemanticProvider({modality: summary}),
+        assets,
+    ).verify("vision", [modality])
+
+    assert result[0].verified is True
+
+
 @pytest.mark.asyncio
 async def test_minimax_native_video_requires_asset_specific_motion_facts(
     tmp_path: Path,

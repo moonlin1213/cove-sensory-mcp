@@ -40,76 +40,79 @@ _BATCH_ABORT_CODES = frozenset(
     }
 )
 
-_EXPECTED_FACT_GROUPS: dict[Modality, tuple[frozenset[str], ...]] = {
-    Modality.IMAGE: (
-        frozenset({"blue", "azure"}),
-        frozenset({"triangle", "triangular"}),
-        frozenset(
-            {
-                "appear",
-                "appears",
-                "centered",
-                "contains",
-                "displays",
-                "shown",
-                "shows",
-                "visible",
-            }
-        ),
-    ),
-    Modality.VIDEO_VISUAL: (
-        frozenset({"red", "crimson"}),
-        frozenset({"ball", "sphere", "circle"}),
-        frozenset(
-            {
-                "move",
-                "moves",
-                "moving",
-                "travel",
-                "travels",
-                "traveling",
-                "travelling",
-                "roll",
-                "rolls",
-                "rolling",
-                "cross",
-                "crosses",
-                "crossing",
-            }
-        ),
-        frozenset({"right", "rightward"}),
-    ),
-    Modality.VIDEO_AUDIO: (
-        frozenset({"bell"}),
-        frozenset({"chime", "chimes", "ring", "rings", "rang", "sounds"}),
-        frozenset({"twice", "two", "second"}),
-    ),
-    Modality.AUDIO: (
-        frozenset({"beep", "beeps", "tone", "tones"}),
-        frozenset({"beeps", "beeping", "sound", "sounds", "plays", "played"}),
-        frozenset({"three", "triple"}),
-    ),
-    Modality.MUSIC: (
-        frozenset({"piano", "keyboard"}),
-        frozenset(
-            {"plays", "played", "playing", "rises", "rose", "ascends", "ascended"}
-        ),
-        frozenset({"ascending", "rising", "upward"}),
-    ),
-}
+_IMAGE_COLOR = frozenset({"blue", "azure"})
+_IMAGE_OBJECT = frozenset({"triangle", "triangular"})
+_IMAGE_EVENT = frozenset(
+    {
+        "appear",
+        "appears",
+        "centered",
+        "contains",
+        "displays",
+        "shown",
+        "shows",
+        "visible",
+    }
+)
+_VIDEO_COLOR = frozenset({"red", "crimson"})
+_VIDEO_OBJECT = frozenset({"ball", "sphere", "circle"})
+_VIDEO_EVENT = frozenset(
+    {
+        "move",
+        "moves",
+        "moving",
+        "travel",
+        "travels",
+        "traveling",
+        "travelling",
+        "roll",
+        "rolls",
+        "rolling",
+        "cross",
+        "crosses",
+        "crossing",
+    }
+)
+_VIDEO_DIRECTION = frozenset({"right", "rightward"})
+_BELL_OBJECT = frozenset({"bell"})
+_BELL_EVENT = frozenset({"chimes", "chimed", "rings", "rang", "sounds"})
+_BELL_COUNT = frozenset({"twice", "two", "second"})
+_AUDIO_OBJECT = frozenset({"beep", "beeps", "tone", "tones"})
+_AUDIO_EVENT = frozenset({"beeps", "beeping", "sounds", "plays", "played"})
+_AUDIO_COUNT = frozenset({"three", "triple"})
+_MUSIC_OBJECT = frozenset({"piano", "keyboard"})
+_MUSIC_EVENT = frozenset(
+    {"plays", "played", "playing", "rises", "rose", "ascends", "ascended"}
+)
+_MUSIC_DIRECTION = frozenset({"ascending", "rising", "upward"})
 
-_CLAUSE_BOUNDARY = re.compile(r"[.;!?\n]+|\b(?:but|however)\b")
+_SUBCLAUSE_BOUNDARY = re.compile(r";|\b(?:but|however)\b")
 _TOKEN = re.compile(r"[a-z0-9]+(?:['’][a-z]+)?")
 _NEGATORS = frozenset({"no", "not", "never", "without", "cannot"})
 _CONTRACTIONS: dict[str, tuple[str, ...]] = {
     "can't": ("cannot",),
     "cannot": ("cannot",),
+    "didn't": ("did", "not"),
     "doesn't": ("does", "not"),
     "isn't": ("is", "not"),
     "wasn't": ("was", "not"),
     "weren't": ("were", "not"),
 }
 _NEGATION_WINDOW = 6
+_POST_DENIAL_WINDOW = 12
+_MAX_SENTENCE_TOKENS = 96
+_MAX_EVENT_SPAN = 16
+_CONTRASTS = (("rather", "than"), ("instead", "of"), ("other", "than"))
+_POST_DENIALS = (
+    ("is", "false"),
+    ("was", "false"),
+    ("not", "heard"),
+    ("not", "seen"),
+    ("not", "visible"),
+    ("did", "not", "happen"),
+)
+
+EvidenceSentence = tuple[tuple[tuple[str, ...], ...], str]
 
 
 def _config_error() -> SensoryError:
@@ -136,16 +139,39 @@ def _observation_text(observation: ObservationEnvelope) -> str:
     return "\n".join(parts).lower()
 
 
-def _token_clauses(text: str) -> tuple[tuple[str, ...], ...]:
-    """Tokenize local clauses and expand contractions into explicit negation tokens."""
-    clauses: list[tuple[str, ...]] = []
-    for raw_clause in _CLAUSE_BOUNDARY.split(text.replace("’", "'")):
+def _tokenize_clause(raw_clause: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for token in _TOKEN.findall(raw_clause):
+        tokens.extend(_CONTRACTIONS.get(token, (token,)))
+    return tuple(tokens)
+
+
+def _evidence_sentences(text: str) -> tuple[EvidenceSentence, ...]:
+    """Tokenize bounded sentences while retaining question and local clause boundaries."""
+    sentences: list[EvidenceSentence] = []
+    body: list[str] = []
+
+    def append_sentence(terminal: str) -> None:
+        raw = "".join(body)
         tokens: list[str] = []
-        for token in _TOKEN.findall(raw_clause):
-            tokens.extend(_CONTRACTIONS.get(token, (token,)))
-        if tokens:
-            clauses.append(tuple(tokens))
-    return tuple(clauses)
+        clauses: list[tuple[str, ...]] = []
+        for raw_clause in _SUBCLAUSE_BOUNDARY.split(raw):
+            clause = _tokenize_clause(raw_clause)
+            if clause:
+                tokens.extend(clause)
+                clauses.append(clause)
+        if clauses and len(tokens) <= _MAX_SENTENCE_TOKENS:
+            sentences.append((tuple(clauses), terminal))
+        body.clear()
+
+    for character in text.replace("’", "'"):
+        if character in ".!?\n":
+            append_sentence(character)
+        else:
+            body.append(character)
+    if body:
+        append_sentence("")
+    return tuple(sentences)
 
 
 def _positive_occurrence(tokens: tuple[str, ...], index: int) -> bool:
@@ -153,29 +179,197 @@ def _positive_occurrence(tokens: tuple[str, ...], index: int) -> bool:
     context = tokens[max(0, index - _NEGATION_WINDOW) : index]
     if any(token in _NEGATORS for token in context):
         return False
+    if _contains_sequence(context, ("is", "false")) or _contains_sequence(
+        context, ("was", "false")
+    ):
+        return False
     for marker in ("fails", "failed"):
         if marker in context and "to" in context[context.index(marker) + 1 :]:
             return False
     return True
 
 
-def _has_positive_term(
-    clauses: tuple[tuple[str, ...], ...],
+def _positive_indices(
+    tokens: tuple[str, ...],
     terms: frozenset[str],
-) -> bool:
-    return any(
-        token in terms and _positive_occurrence(tokens, index)
-        for tokens in clauses
+) -> tuple[int, ...]:
+    cutoff = _contrast_cutoff(tokens)
+    return tuple(
+        index
         for index, token in enumerate(tokens)
+        if index < cutoff and token in terms and _positive_occurrence(tokens, index)
+    )
+
+
+def _contrast_cutoff(tokens: tuple[str, ...]) -> int:
+    cutoffs = [
+        index
+        for index in range(len(tokens) - 1)
+        if (tokens[index], tokens[index + 1]) in _CONTRASTS
+    ]
+    return min(cutoffs, default=len(tokens))
+
+
+def _bounded(*indices: int, limit: int = _MAX_EVENT_SPAN) -> bool:
+    return max(indices) - min(indices) <= limit
+
+
+def _contains_sequence(tokens: tuple[str, ...], expected: tuple[str, ...]) -> bool:
+    return any(
+        tokens[index : index + len(expected)] == expected
+        for index in range(len(tokens) - len(expected) + 1)
+    )
+
+
+def _sentence_denies_after(
+    clauses: tuple[tuple[str, ...], ...],
+    clause_index: int,
+    candidate_end: int,
+) -> bool:
+    tail = list(clauses[clause_index][candidate_end + 1 :])
+    for later_clause in clauses[clause_index + 1 :]:
+        tail.extend(later_clause)
+        if len(tail) > _POST_DENIAL_WINDOW:
+            break
+    if len(tail) > _POST_DENIAL_WINDOW:
+        return True
+    bounded_tail = tuple(tail[:_POST_DENIAL_WINDOW])
+    if bounded_tail and bounded_tail[0] in {"no", "not", "never"}:
+        return True
+    return any(_contains_sequence(bounded_tail, denial) for denial in _POST_DENIALS)
+
+
+def _image_candidate_ends(tokens: tuple[str, ...]) -> tuple[int, ...]:
+    colors = _positive_indices(tokens, _IMAGE_COLOR)
+    objects = _positive_indices(tokens, _IMAGE_OBJECT)
+    events = _positive_indices(tokens, _IMAGE_EVENT)
+    return tuple(
+        max(color, object_index, event)
+        for color in colors
+        for object_index in objects
+        for event in events
+        if _bounded(color, object_index, event)
+    )
+
+
+def _video_candidate_ends(
+    clauses: tuple[tuple[str, ...], ...],
+    clause_index: int,
+) -> tuple[int, ...]:
+    tokens = clauses[clause_index]
+    colors = _positive_indices(tokens, _VIDEO_COLOR)
+    objects = _positive_indices(tokens, _VIDEO_OBJECT)
+    events = _positive_indices(tokens, _VIDEO_EVENT)
+    directions = _positive_indices(tokens, _VIDEO_DIRECTION)
+
+    def has_same_subject(event: int) -> bool:
+        return any(color < event for color in colors) and any(
+            object_index < event for object_index in objects
+        )
+
+    previous_subject = False
+    if clause_index > 0:
+        previous = clauses[clause_index - 1]
+        previous_colors = _positive_indices(previous, _VIDEO_COLOR)
+        previous_objects = _positive_indices(previous, _VIDEO_OBJECT)
+        previous_end = (
+            max(previous_colors + previous_objects)
+            if previous_colors and previous_objects
+            else 0
+        )
+        previous_subject = bool(
+            previous_colors
+            and previous_objects
+            and "it" in tokens
+            and not _sentence_denies_after(
+                clauses,
+                clause_index - 1,
+                previous_end,
+            )
+        )
+    return tuple(
+        direction
+        for event in events
+        for direction in directions
+        if event < direction <= event + 8
+        and (has_same_subject(event) or previous_subject)
+    )
+
+
+def _event_candidate_ends(
+    tokens: tuple[str, ...],
+    *,
+    objects: frozenset[str],
+    events: frozenset[str],
+    qualifiers: frozenset[str],
+    object_must_precede: bool,
+    qualifier_must_follow: bool,
+) -> tuple[int, ...]:
+    object_indices = _positive_indices(tokens, objects)
+    event_indices = _positive_indices(tokens, events)
+    qualifier_indices = _positive_indices(tokens, qualifiers)
+    return tuple(
+        max(object_index, event, qualifier)
+        for object_index in object_indices
+        for event in event_indices
+        for qualifier in qualifier_indices
+        if (not object_must_precede or object_index <= event)
+        and (not qualifier_must_follow or event < qualifier)
+        and abs(object_index - event) <= 6
+        and abs(qualifier - event) <= 6
+        and _bounded(object_index, event, qualifier, limit=10)
+    )
+
+
+def _candidate_ends(
+    modality: Modality,
+    clauses: tuple[tuple[str, ...], ...],
+    clause_index: int,
+) -> tuple[int, ...]:
+    tokens = clauses[clause_index]
+    if modality is Modality.IMAGE:
+        return _image_candidate_ends(tokens)
+    if modality is Modality.VIDEO_VISUAL:
+        return _video_candidate_ends(clauses, clause_index)
+    if modality is Modality.VIDEO_AUDIO:
+        return _event_candidate_ends(
+            tokens,
+            objects=_BELL_OBJECT,
+            events=_BELL_EVENT,
+            qualifiers=_BELL_COUNT,
+            object_must_precede=True,
+            qualifier_must_follow=True,
+        )
+    if modality is Modality.AUDIO:
+        return _event_candidate_ends(
+            tokens,
+            objects=_AUDIO_OBJECT,
+            events=_AUDIO_EVENT,
+            qualifiers=_AUDIO_COUNT,
+            object_must_precede=False,
+            qualifier_must_follow=False,
+        )
+    return _event_candidate_ends(
+        tokens,
+        objects=_MUSIC_OBJECT,
+        events=_MUSIC_EVENT,
+        qualifiers=_MUSIC_DIRECTION,
+        object_must_precede=True,
+        qualifier_must_follow=True,
     )
 
 
 def _matches_expected_facts(
     modality: Modality, observation: ObservationEnvelope
 ) -> bool:
-    clauses = _token_clauses(_observation_text(observation))
-    return all(
-        _has_positive_term(clauses, group) for group in _EXPECTED_FACT_GROUPS[modality]
+    return any(
+        terminal != "?"
+        and any(
+            not _sentence_denies_after(clauses, clause_index, candidate_end)
+            for clause_index in range(len(clauses))
+            for candidate_end in _candidate_ends(modality, clauses, clause_index)
+        )
+        for clauses, terminal in _evidence_sentences(_observation_text(observation))
     )
 
 

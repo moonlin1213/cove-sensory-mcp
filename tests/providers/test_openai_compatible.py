@@ -619,6 +619,35 @@ class BlockingAsyncStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class DelayedCloseAsyncStream(BlockingAsyncStream):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.close_gate = asyncio.Event()
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.close_gate.wait()
+        self.closed = True
+
+
+class FailingCloseAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.iterated = False
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.iterated = True
+        yield self.body
+
+    async def aclose(self) -> None:
+        self.closed = True
+        raise OSError("private-response-close-detail")
+
+
 class RejectIfIteratedStream(httpx.AsyncByteStream):
     def __init__(self, compressed: bytes) -> None:
         self.compressed = compressed
@@ -804,6 +833,131 @@ async def test_streaming_cancellation_propagates_and_closes_response(tmp_path: P
         with pytest.raises(asyncio.CancelledError):
             await task
 
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_response_close_survives_repeated_cancellation(tmp_path: Path) -> None:
+    """Cancellation must wait for the independently owned response close task."""
+    media = tmp_path / "repeated-cancel.jpg"
+    media.write_bytes(b"image")
+    stream = DelayedCloseAsyncStream()
+
+    async with _client(lambda request: httpx.Response(200, stream=stream)) as client:
+        task = asyncio.create_task(
+            _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+        )
+        await stream.started.wait()
+        task.cancel()
+        await stream.close_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        done_before_close = task.done()
+        stream.close_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert done_before_close is False
+    assert stream.close_calls == 1
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_response_close_failure_is_reported_without_masking_primary_error(
+    tmp_path: Path,
+) -> None:
+    """Close failures matter on success but never replace an earlier response error."""
+    media = tmp_path / "close-failure.jpg"
+    media.write_bytes(b"image")
+    valid_body = json.dumps(_chat_response(Modality.IMAGE)).encode("utf-8")
+    success_stream = FailingCloseAsyncStream(valid_body)
+
+    async with _client(
+        lambda request: httpx.Response(200, stream=success_stream)
+    ) as client:
+        with pytest.raises(SensoryError) as close_caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert close_caught.value.code is ErrorCode.PROVIDER_UNAVAILABLE
+    assert "private-response-close-detail" not in str(close_caught.value)
+    assert success_stream.closed is True
+
+    primary_stream = FailingCloseAsyncStream(b"private-compressed-marker")
+    async with _client(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=primary_stream,
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as primary_caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert primary_caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert "private-" not in str(primary_caught.value)
+    assert primary_stream.iterated is False
+    assert primary_stream.closed is True
+
+
+@pytest.mark.parametrize(
+    "content_lengths",
+    [
+        pytest.param(["9" * 100_000], id="huge-digits"),
+        pytest.param(["8388608x"], id="malformed"),
+        pytest.param(["1", "1"], id="duplicate"),
+        pytest.param([str(_MAX_RESPONSE_BYTES + 1)], id="ordinary-over-cap"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_content_length_is_rejected_unread_and_closed(
+    tmp_path: Path,
+    content_lengths: list[str],
+) -> None:
+    """Even enormous numeric metadata must take the stable bounded rejection path."""
+    media = tmp_path / "content-length.jpg"
+    media.write_bytes(b"image")
+    stream = RejectIfIteratedStream(b"private-response-marker")
+    headers = [("content-length", value) for value in content_lengths]
+
+    async with _client(
+        lambda request: httpx.Response(200, headers=headers, stream=stream)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert caught.value.retryable is False
+    assert caught.value.cause is None
+    assert "private-response-marker" not in str(caught.value)
+    assert stream.iterated is False
     assert stream.closed is True
 
 
@@ -1088,6 +1242,53 @@ async def test_borrowed_client_remains_open() -> None:
     await provider.aclose()
     assert borrowed.is_closed is False
     await borrowed.aclose()
+
+
+class DelayedCloseClient:
+    def __init__(self) -> None:
+        self.is_closed = False
+        self.close_started = asyncio.Event()
+        self.close_gate = asyncio.Event()
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.close_gate.wait()
+        self.is_closed = True
+
+
+@pytest.mark.asyncio
+async def test_owned_client_close_survives_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider must not return until its owned transport has closed."""
+    client = DelayedCloseClient()
+    monkeypatch.setattr(
+        compatible_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: cast(Any, client),
+    )
+    provider = OpenAICompatibleProvider(
+        provider_id="custom",
+        config=_config("image_url_data_uri"),
+        secret_store=_store(),
+    )
+
+    task = asyncio.create_task(provider.aclose())
+    await client.close_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    done_before_close = task.done()
+    client.close_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert done_before_close is False
+    assert client.close_calls == 1
+    assert client.is_closed is True
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,9 @@ import base64
 import json
 import os
 import re
+from contextlib import AbstractAsyncContextManager
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 
@@ -27,6 +28,7 @@ _DEFAULT_TEMPERATURE = 0.2
 _DEFAULT_TIMEOUT_SECONDS = 120.0
 _MAX_MODEL_LENGTH = 256
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_MAX_RESPONSE_BYTES_TEXT = str(_MAX_RESPONSE_BYTES)
 _MAX_CONTENT_BLOCKS = 64
 _MAX_TEXT_CHARS = 2_000_000
 _MAX_HEADER_VALUE_LENGTH = 8_192
@@ -53,6 +55,35 @@ class _FailureKind(str, Enum):
 
 class _ResponseReadRejected(Exception):
     """Internal size marker that deliberately retains no response bytes."""
+
+
+_TaskResult = TypeVar("_TaskResult")
+
+
+async def _await_owned_task(
+    task: asyncio.Task[_TaskResult],
+) -> tuple[BaseException | None, bool]:
+    """Await a cleanup task to terminal despite repeated caller cancellation."""
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                interrupted = True
+        except BaseException:  # noqa: BLE001 - inspect only after task terminal
+            break
+    if task.cancelled():
+        return asyncio.CancelledError(), interrupted
+    return task.exception(), interrupted
+
+
+async def _close_response_context(
+    context: AbstractAsyncContextManager[httpx.Response],
+) -> tuple[BaseException | None, bool]:
+    close_task = asyncio.create_task(context.__aexit__(None, None, None))
+    return await _await_owned_task(close_task)
 
 
 def _config_error() -> SensoryError:
@@ -206,10 +237,14 @@ def _declared_content_length(response: httpx.Response) -> None:
     raw_length = response.headers.get("content-length")
     if raw_length is None:
         return
-    if (
-        not raw_length.isascii()
-        or not raw_length.isdigit()
-        or int(raw_length) > _MAX_RESPONSE_BYTES
+    if len(raw_length) > len(_MAX_RESPONSE_BYTES_TEXT):
+        raise _ResponseReadRejected
+    if not raw_length.isascii() or not raw_length.isdigit():
+        raise _ResponseReadRejected
+    normalized = raw_length.lstrip("0") or "0"
+    if len(normalized) > len(_MAX_RESPONSE_BYTES_TEXT) or (
+        len(normalized) == len(_MAX_RESPONSE_BYTES_TEXT)
+        and normalized > _MAX_RESPONSE_BYTES_TEXT
     ):
         raise _ResponseReadRejected
 
@@ -534,14 +569,17 @@ class OpenAICompatibleProvider:
         response_success = False
         response_body = b""
         try:
-            async with self._client.stream(
+            response_context = self._client.stream(
                 "POST",
                 self._endpoint,
                 headers=headers,
                 json=payload,
                 timeout=self._timeout(),
                 follow_redirects=False,
-            ) as response:
+            )
+            response = await response_context.__aenter__()
+            primary_failure: BaseException | None = None
+            try:
                 response_status = response.status_code
                 response_success = response.is_success
                 if response.is_redirect:
@@ -552,6 +590,17 @@ class OpenAICompatibleProvider:
                     if response_success:
                         raise _response_error() from None
                     raise _public_error(_FailureKind.UNAVAILABLE) from None
+            except BaseException as exc:  # noqa: BLE001 - re-raised after close
+                primary_failure = exc
+            close_failure, close_interrupted = await _close_response_context(
+                response_context
+            )
+            if primary_failure is not None:
+                raise primary_failure
+            if close_interrupted:
+                raise asyncio.CancelledError
+            if close_failure is not None:
+                raise close_failure
         except asyncio.CancelledError:
             raise
         except SensoryError:
@@ -603,4 +652,9 @@ class OpenAICompatibleProvider:
     async def aclose(self) -> None:
         """Close only a client created and owned by this adapter."""
         if self._owns_client and not self._client.is_closed:
-            await self._client.aclose()
+            close_task = asyncio.create_task(self._client.aclose())
+            close_failure, interrupted = await _await_owned_task(close_task)
+            if interrupted:
+                raise asyncio.CancelledError
+            if close_failure is not None:
+                raise close_failure

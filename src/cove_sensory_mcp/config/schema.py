@@ -83,6 +83,7 @@ _MAX_INLINE_BYTES = 1_073_741_824
 _MAX_OUTPUT_TOKENS = 1_000_000
 _MAX_REQUEST_TIMEOUT_SECONDS = 3_600
 _MAX_ENDPOINT_PATH_LENGTH = 1_024
+_MAX_PROVIDER_MODEL_LENGTH = 256
 _ADAPTER_OPTION_NAMES = frozenset(
     {
         "inline_max_bytes",
@@ -96,6 +97,7 @@ _ADAPTER_OPTION_NAMES = frozenset(
 )
 _INVALID_ADAPTER_OPTIONS_MESSAGE = "Adapter options contain an unsupported field."
 _INVALID_EXTRA_HEADERS_MESSAGE = "Adapter header environment references are invalid."
+_INVALID_PROVIDER_MODEL_MESSAGE = "The provider model identifier is invalid."
 
 
 def _private_adapter_validation_error(
@@ -296,7 +298,7 @@ class ProviderConfig(BaseModel):
 
     adapter: str = Field(min_length=1)
     base_url: str | None = None
-    model: str = Field(min_length=1)
+    model: StrictStr
     credential_ref: str | None = Field(default=None, min_length=1)
     api_key_env: str | None = None
     declared_capabilities: CapabilityMap = Field(default_factory=dict)
@@ -313,6 +315,18 @@ class ProviderConfig(BaseModel):
         exclude_if=_adapter_options_are_empty,
     )
     last_verified_at: datetime | None = None
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def validate_model_identifier(cls, value: object) -> str:
+        """Require one strict bounded model name without retaining rejected input."""
+        if type(value) is not str or not value or len(value) > _MAX_PROVIDER_MODEL_LENGTH:
+            raise _private_adapter_validation_error(
+                cls.__name__,
+                "provider_model_invalid",
+                _INVALID_PROVIDER_MODEL_MESSAGE,
+            )
+        return value
 
     @field_validator("api_key_env")
     @classmethod

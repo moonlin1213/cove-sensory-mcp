@@ -106,6 +106,7 @@ class ProviderCandidate:
     """One configured and verified route entry in deterministic order."""
 
     provider_id: ProviderId
+    expected_model: str
     modalities: frozenset[Modality]
     is_fallback: bool = False
 

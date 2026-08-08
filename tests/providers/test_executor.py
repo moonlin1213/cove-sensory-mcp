@@ -28,11 +28,12 @@ from cove_sensory_mcp.reports.schemas import ObservationEnvelope
 def _provider_config(
     *modalities: Modality,
     joint: tuple[frozenset[Modality], ...] = (),
+    model: str = "test-model",
 ) -> ProviderConfig:
     capabilities = {modality: True for modality in modalities}
     return ProviderConfig(
         adapter="test-adapter",
-        model="test-model",
+        model=model,
         credential_ref="test-credential",
         declared_capabilities=capabilities,
         verified_capabilities=capabilities,
@@ -70,6 +71,8 @@ def _observation(modality: Modality, summary: str) -> ObservationEnvelope:
 def _success(
     provider_id: str,
     modalities: frozenset[Modality],
+    *,
+    model: str = "test-model",
 ) -> ProviderCallResult:
     return ProviderCallResult(
         observations={
@@ -77,7 +80,7 @@ def _success(
             for modality in modalities
         },
         provider_id=provider_id,
-        model="test-model",
+        model=model,
         remote_file_deleted=None,
     )
 
@@ -85,7 +88,7 @@ def _success(
 class ScriptedProvider:
     def __init__(
         self,
-        outcomes: Sequence[ProviderCallResult | BaseException],
+        outcomes: Sequence[object],
     ) -> None:
         self._outcomes = list(outcomes)
         self.requests: list[ProviderRequest] = []
@@ -95,7 +98,7 @@ class ScriptedProvider:
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
-        return outcome
+        return cast(ProviderCallResult, outcome)
 
 
 def _single_config(
@@ -105,7 +108,10 @@ def _single_config(
     providers = {"primary": _provider_config(Modality.VIDEO_VISUAL)}
     fallbacks: list[ProviderRef] = []
     if fallback_authorized is not None:
-        providers["fallback"] = _provider_config(Modality.VIDEO_VISUAL)
+        providers["fallback"] = _provider_config(
+            Modality.VIDEO_VISUAL,
+            model="fallback-model",
+        )
         fallbacks.append(
             ProviderRef(provider="fallback", authorized=fallback_authorized)
         )
@@ -137,7 +143,9 @@ async def test_primary_success_returns_exact_execution_metadata() -> None:
     """Using fallback metadata on primary success would misreport where media was sent."""
     modalities = frozenset({Modality.VIDEO_VISUAL})
     primary = ScriptedProvider([_success("primary", modalities)])
-    fallback = ScriptedProvider([_success("fallback", modalities)])
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
 
     result = await _executor(
         _single_config(fallback_authorized=True),
@@ -147,7 +155,9 @@ async def test_primary_success_returns_exact_execution_metadata() -> None:
 
     assert result.observations == _success("primary", modalities).observations
     assert result.requested_provider == "primary"
+    assert result.requested_model == "test-model"
     assert result.used_provider == "primary"
+    assert result.used_model == "test-model"
     assert result.fallback_used is False
     assert result.failures == ()
     assert len(primary.requests) == 1
@@ -167,7 +177,9 @@ async def test_retryable_failure_uses_only_the_ordered_authorized_fallback() -> 
             )
         ]
     )
-    fallback = ScriptedProvider([_success("fallback", modalities)])
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
 
     result = await _executor(
         _single_config(fallback_authorized=True),
@@ -176,7 +188,9 @@ async def test_retryable_failure_uses_only_the_ordered_authorized_fallback() -> 
     ).sense(modalities, _request(modalities))
 
     assert result.requested_provider == "primary"
+    assert result.requested_model == "test-model"
     assert result.used_provider == "fallback"
+    assert result.used_model == "fallback-model"
     assert result.fallback_used is True
     assert result.failures == (ErrorCode.PROVIDER_TIMEOUT,)
     assert len(primary.requests) == len(fallback.requests) == 1
@@ -194,7 +208,9 @@ async def test_safety_rejection_uses_an_explicitly_authorized_fallback() -> None
             )
         ]
     )
-    fallback = ScriptedProvider([_success("fallback", modalities)])
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
 
     result = await _executor(
         _single_config(fallback_authorized=True),
@@ -203,6 +219,7 @@ async def test_safety_rejection_uses_an_explicitly_authorized_fallback() -> None
     ).sense(modalities, _request(modalities))
 
     assert result.used_provider == "fallback"
+    assert result.used_model == "fallback-model"
     assert result.fallback_used is True
     assert result.failures == (ErrorCode.PROVIDER_SAFETY_REJECTED,)
     assert len(fallback.requests) == 1
@@ -221,7 +238,9 @@ async def test_unauthorized_fallback_is_never_invoked_and_is_reported() -> None:
             )
         ]
     )
-    fallback = ScriptedProvider([_success("fallback", modalities)])
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
 
     result = await _executor(
         _single_config(fallback_authorized=False),
@@ -231,7 +250,9 @@ async def test_unauthorized_fallback_is_never_invoked_and_is_reported() -> None:
 
     assert result.observations == {}
     assert result.requested_provider == "primary"
+    assert result.requested_model == "test-model"
     assert result.used_provider is None
+    assert result.used_model is None
     assert result.fallback_used is False
     assert result.failures == (
         ErrorCode.PROVIDER_UNAVAILABLE,
@@ -272,6 +293,7 @@ async def test_all_authorized_providers_fail_with_codes_only() -> None:
 
     assert result.observations == {}
     assert result.used_provider is None
+    assert result.used_model is None
     assert result.fallback_used is False
     assert result.failures == (
         ErrorCode.PROVIDER_TIMEOUT,
@@ -285,7 +307,9 @@ async def test_cancellation_propagates_without_starting_fallback() -> None:
     """Catching cancellation as a Provider failure could start an unwanted paid call."""
     modalities = frozenset({Modality.VIDEO_VISUAL})
     primary = ScriptedProvider([asyncio.CancelledError()])
-    fallback = ScriptedProvider([_success("fallback", modalities)])
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
 
     with pytest.raises(asyncio.CancelledError):
         await _executor(
@@ -327,7 +351,9 @@ async def test_terminal_errors_never_start_fallback(error: SensoryError) -> None
     """Falling back on terminal errors would resend invalid or unauthorized requests."""
     modalities = frozenset({Modality.VIDEO_VISUAL})
     primary = ScriptedProvider([error])
-    fallback = ScriptedProvider([_success("fallback", modalities)])
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
 
     result = await _executor(
         _single_config(fallback_authorized=True),
@@ -389,6 +415,7 @@ async def test_verified_joint_request_uses_one_provider_call_for_exact_modalitie
 
     assert set(result.observations) == modalities
     assert result.requested_provider == result.used_provider == "joint"
+    assert result.requested_model == result.used_model == "test-model"
     assert result.fallback_used is False
     assert len(joint.requests) == 1
     assert joint.requests[0].requested_modalities == modalities
@@ -509,10 +536,12 @@ class DuplicateCandidateRouter:
         return [
             ProviderCandidate(
                 provider_id="primary",
+                expected_model="test-model",
                 modalities=frozenset({Modality.VIDEO_VISUAL}),
             ),
             ProviderCandidate(
                 provider_id="primary",
+                expected_model="test-model",
                 modalities=frozenset({Modality.VIDEO_VISUAL}),
                 is_fallback=True,
             ),
@@ -556,3 +585,268 @@ async def test_unexpected_provider_exception_is_sanitized_without_fallback() -> 
 
     assert result.failures == (ErrorCode.PROVIDER_UNAVAILABLE,)
     assert marker not in repr(result)
+
+
+class SharedCandidateRouter:
+    def __init__(self) -> None:
+        self.entries = [
+            ProviderCandidate(
+                provider_id="primary",
+                expected_model="test-model",
+                modalities=frozenset({Modality.VIDEO_VISUAL}),
+            ),
+            ProviderCandidate(
+                provider_id="fallback",
+                expected_model="fallback-model",
+                modalities=frozenset({Modality.VIDEO_VISUAL}),
+                is_fallback=True,
+            ),
+        ]
+
+    def candidates(self, modality: Modality) -> list[ProviderCandidate]:
+        assert modality is Modality.VIDEO_VISUAL
+        return self.entries
+
+    def joint_candidate(
+        self,
+        modalities: frozenset[Modality],
+    ) -> NoReturn:
+        del modalities
+        raise AssertionError("joint_candidate must not be used")
+
+
+class MutatingPrimary:
+    def __init__(self, router: SharedCandidateRouter) -> None:
+        self._router = router
+        self.requests: list[ProviderRequest] = []
+
+    async def sense(self, request: ProviderRequest) -> ProviderCallResult:
+        self.requests.append(request)
+        authorized_fallback = self._router.entries[1]
+        intruder = ProviderCandidate(
+            provider_id="intruder",
+            expected_model="intruder-model",
+            modalities=frozenset({Modality.VIDEO_VISUAL}),
+            is_fallback=True,
+        )
+        self._router.entries[:] = [
+            authorized_fallback,
+            intruder,
+        ]
+        raise SensoryError(
+            ErrorCode.PROVIDER_TIMEOUT,
+            "private timeout",
+            retryable=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_route_sequence_is_snapshotted_before_the_first_provider_await() -> None:
+    """Mutating the Router list during a call must not inject or delete a Provider."""
+    modalities = frozenset({Modality.VIDEO_VISUAL})
+    router = SharedCandidateRouter()
+    primary = MutatingPrimary(router)
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
+    intruder = ScriptedProvider(
+        [_success("intruder", modalities, model="intruder-model")]
+    )
+    executor = ProviderExecutor(
+        router=cast(ProviderRouter, router),
+        registry=ProviderRegistry(
+            {
+                "primary": cast(SensoryProvider, primary),
+                "fallback": cast(SensoryProvider, fallback),
+                "intruder": cast(SensoryProvider, intruder),
+            }
+        ),
+    )
+
+    result = await executor.sense(modalities, _request(modalities))
+
+    assert result.used_provider == "fallback"
+    assert result.used_model == "fallback-model"
+    assert result.fallback_used is True
+    assert len(primary.requests) == len(fallback.requests) == 1
+    assert intruder.requests == []
+
+
+class MutableModalitiesRouter:
+    def candidates(self, modality: Modality) -> list[ProviderCandidate]:
+        return [
+            ProviderCandidate(
+                provider_id="primary",
+                expected_model="test-model",
+                modalities=cast(frozenset[Modality], {modality}),
+            )
+        ]
+
+    def joint_candidate(
+        self,
+        modalities: frozenset[Modality],
+    ) -> NoReturn:
+        del modalities
+        raise AssertionError("joint_candidate must not be used")
+
+
+class NonBooleanFallbackRouter:
+    def candidates(self, modality: Modality) -> list[ProviderCandidate]:
+        return [
+            ProviderCandidate(
+                provider_id="primary",
+                expected_model="test-model",
+                modalities=frozenset({modality}),
+                is_fallback=cast(bool, 0),
+            )
+        ]
+
+    def joint_candidate(
+        self,
+        modalities: frozenset[Modality],
+    ) -> NoReturn:
+        del modalities
+        raise AssertionError("joint_candidate must not be used")
+
+
+@pytest.mark.asyncio
+async def test_mutable_candidate_modalities_are_rejected_before_any_call() -> None:
+    """Retaining a nested mutable modality set would invalidate the route snapshot."""
+    modalities = frozenset({Modality.VIDEO_VISUAL})
+    primary = ScriptedProvider([_success("primary", modalities)])
+    executor = ProviderExecutor(
+        router=cast(ProviderRouter, MutableModalitiesRouter()),
+        registry=ProviderRegistry({"primary": cast(SensoryProvider, primary)}),
+    )
+
+    with pytest.raises(SensoryError) as caught:
+        await executor.sense(modalities, _request(modalities))
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert primary.requests == []
+
+
+@pytest.mark.asyncio
+async def test_non_boolean_candidate_fallback_flag_is_rejected_before_call() -> None:
+    """Accepting integer truthiness could alter the immutable authorization snapshot."""
+    modalities = frozenset({Modality.VIDEO_VISUAL})
+    primary = ScriptedProvider([_success("primary", modalities)])
+    executor = ProviderExecutor(
+        router=cast(ProviderRouter, NonBooleanFallbackRouter()),
+        registry=ProviderRegistry({"primary": cast(SensoryProvider, primary)}),
+    )
+
+    with pytest.raises(SensoryError) as caught:
+        await executor.sense(modalities, _request(modalities))
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert primary.requests == []
+
+
+class RaisingResult:
+    provider_id = "primary"
+
+    @property
+    def observations(self) -> NoReturn:
+        raise RuntimeError("private-result-property")
+
+
+class RaisingObservationDict(dict[Modality, ObservationEnvelope]):
+    def __iter__(self) -> NoReturn:
+        raise RuntimeError("private-observation-iterator")
+
+
+class ModelNameSubclass(str):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "private_marker"),
+    [
+        pytest.param(None, "", id="none"),
+        pytest.param(object(), "", id="plain-object"),
+        pytest.param(RaisingResult(), "private-result-property", id="raising-property"),
+        pytest.param(
+            ProviderCallResult(
+                observations=RaisingObservationDict(),
+                provider_id="primary",
+                model="test-model",
+                remote_file_deleted=None,
+            ),
+            "private-observation-iterator",
+            id="malicious-dict-subclass",
+        ),
+    ],
+)
+async def test_malformed_provider_result_is_terminal_and_raw_free(
+    result: object,
+    private_marker: str,
+) -> None:
+    """Malformed return objects must not escape their properties or start fallback."""
+    modalities = frozenset({Modality.VIDEO_VISUAL})
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
+
+    executed = await _executor(
+        _single_config(fallback_authorized=True),
+        primary=ScriptedProvider([result]),
+        fallback=fallback,
+    ).sense(modalities, _request(modalities))
+
+    assert executed.failures == (ErrorCode.PROVIDER_CAPABILITY_REJECTED,)
+    assert executed.observations == {}
+    assert executed.used_provider is None
+    assert executed.used_model is None
+    if private_marker:
+        assert private_marker not in repr(executed)
+    assert fallback.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "returned_model",
+    [
+        pytest.param("wrong-model", id="wrong"),
+        pytest.param("", id="empty"),
+        pytest.param("x" * 257, id="overlong"),
+        pytest.param(ModelNameSubclass("test-model"), id="str-subclass"),
+    ],
+)
+async def test_result_model_must_exactly_match_the_routed_model(
+    returned_model: str,
+) -> None:
+    """Accepting inconsistent model metadata would misreport which model saw media."""
+    modalities = frozenset({Modality.VIDEO_VISUAL})
+    fallback = ScriptedProvider(
+        [_success("fallback", modalities, model="fallback-model")]
+    )
+
+    result = await _executor(
+        _single_config(fallback_authorized=True),
+        primary=ScriptedProvider(
+            [_success("primary", modalities, model=returned_model)]
+        ),
+        fallback=fallback,
+    ).sense(modalities, _request(modalities))
+
+    assert result.failures == (ErrorCode.PROVIDER_CAPABILITY_REJECTED,)
+    assert result.used_provider is None
+    assert result.used_model is None
+    assert fallback.requests == []
+
+
+@pytest.mark.asyncio
+async def test_control_base_exception_from_provider_is_not_sanitized() -> None:
+    """Catching control BaseExceptions would prevent immediate process-level control."""
+    modalities = frozenset({Modality.VIDEO_VISUAL})
+
+    with pytest.raises(SystemExit):
+        await _executor(
+            _single_config(fallback_authorized=True),
+            primary=ScriptedProvider([SystemExit(7)]),
+            fallback=ScriptedProvider(
+                [_success("fallback", modalities, model="fallback-model")]
+            ),
+        ).sense(modalities, _request(modalities))

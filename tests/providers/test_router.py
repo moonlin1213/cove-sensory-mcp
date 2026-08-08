@@ -25,10 +25,11 @@ from cove_sensory_mcp.providers.router import ProviderRouter
 def _provider(
     *verified_modalities: Modality,
     joint: tuple[frozenset[Modality], ...] = (),
+    model: str = "test-model",
 ) -> ProviderConfig:
     return ProviderConfig(
         adapter="test-adapter",
-        model="test-model",
+        model=model,
         credential_ref="test-credential",
         declared_capabilities={modality: True for modality in verified_modalities},
         verified_capabilities={modality: True for modality in verified_modalities},
@@ -64,6 +65,7 @@ def test_verified_primary_is_returned_first() -> None:
     candidates = ProviderRouter(config).candidates(Modality.IMAGE)
 
     assert [candidate.provider_id for candidate in candidates] == ["primary"]
+    assert candidates[0].expected_model == "test-model"
     assert candidates[0].modalities == frozenset({Modality.IMAGE})
     assert candidates[0].is_fallback is False
 
@@ -93,8 +95,8 @@ def test_authorized_fallback_is_returned_after_primary() -> None:
     config = AppConfig(
         providers={
             "primary": _provider(Modality.IMAGE),
-            "fallback-one": _provider(Modality.IMAGE),
-            "fallback-two": _provider(Modality.IMAGE),
+            "fallback-one": _provider(Modality.IMAGE, model="fallback-one-model"),
+            "fallback-two": _provider(Modality.IMAGE, model="fallback-two-model"),
         },
         routes=RoutesConfig(
             image=RouteConfig(
@@ -115,6 +117,11 @@ def test_authorized_fallback_is_returned_after_primary() -> None:
         "fallback-two",
     ]
     assert [candidate.is_fallback for candidate in candidates] == [False, True, True]
+    assert [candidate.expected_model for candidate in candidates] == [
+        "test-model",
+        "fallback-one-model",
+        "fallback-two-model",
+    ]
 
 
 def test_unknown_provider_id_is_config_invalid_without_identifier_echo() -> None:
@@ -166,6 +173,7 @@ def test_joint_candidate_requires_same_primary_and_exact_verified_set() -> None:
 
     assert candidate is not None
     assert candidate.provider_id == "gemini"
+    assert candidate.expected_model == "test-model"
     assert candidate.modalities == exact
     assert candidate.is_fallback is False
 
@@ -705,6 +713,31 @@ def test_adapter_options_accepts_each_v1_media_part_mode(mode: str) -> None:
     )
 
     assert provider.adapter_options.media_part_mode == mode
+
+
+@pytest.mark.parametrize(
+    ("model", "private_marker"),
+    [
+        pytest.param("", "", id="empty"),
+        pytest.param(b"private-bytes-model", "private-bytes-model", id="not-strict-str"),
+        pytest.param("private-" + "x" * 257, "private-", id="overlong"),
+    ],
+)
+def test_provider_model_is_strict_bounded_and_input_private(
+    model: object,
+    private_marker: str,
+) -> None:
+    """An unbounded or coerced model could corrupt trusted execution metadata."""
+    with pytest.raises(ValidationError) as caught:
+        ProviderConfig(
+            adapter="test-adapter",
+            model=model,
+            credential_ref="test-credential",
+        )
+
+    diagnostics = f"{caught.value}\n{caught.value!r}\n{caught.value.errors()!r}"
+    if private_marker:
+        assert private_marker not in diagnostics
 
 
 @pytest.mark.parametrize(

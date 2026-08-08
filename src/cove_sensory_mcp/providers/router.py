@@ -55,10 +55,11 @@ class ProviderRouter:
                 _NOT_CONFIGURED_MESSAGE,
             )
 
-        self._verified_provider(route.primary, modality)
+        primary_provider = self._verified_provider(route.primary, modality)
         candidates = [
             ProviderCandidate(
                 provider_id=route.primary,
+                expected_model=primary_provider.model,
                 modalities=frozenset({modality}),
             )
         ]
@@ -70,10 +71,11 @@ class ProviderRouter:
             seen.add(fallback.provider)
             if not fallback.authorized:
                 continue
-            self._verified_provider(fallback.provider, modality)
+            fallback_provider = self._verified_provider(fallback.provider, modality)
             candidates.append(
                 ProviderCandidate(
                     provider_id=fallback.provider,
+                    expected_model=fallback_provider.model,
                     modalities=frozenset({modality}),
                     is_fallback=True,
                 )
@@ -103,4 +105,8 @@ class ProviderRouter:
             self._verified_provider(primary, modality)
         if modalities not in provider.verified_joint_capabilities:
             return None
-        return ProviderCandidate(provider_id=primary, modalities=modalities)
+        return ProviderCandidate(
+            provider_id=primary,
+            expected_model=provider.model,
+            modalities=modalities,
+        )

@@ -660,23 +660,14 @@ async def test_configured_request_bounds_reach_exact_payload_and_timeout(tmp_pat
     assert timeout == {"connect": 7.5, "read": 7.5, "write": 7.5, "pool": 7.5}
 
 
-@pytest.mark.parametrize(
-    ("config", "message_part"),
-    [
-        pytest.param(_config(model="m" * 257), "model", id="model-length"),
-        pytest.param(_config(temperature=1.1), "temperature", id="high-temperature"),
-    ],
-)
-def test_adapter_rejects_values_outside_its_low_variance_bounds(
-    config: ProviderConfig,
-    message_part: str,
-) -> None:
-    """Accepting an unbounded model name or high temperature would violate adapter limits."""
+def test_adapter_rejects_temperature_outside_its_low_variance_bound() -> None:
+    """Accepting high temperature would make observation output less deterministic."""
+    config = _config(temperature=1.1)
     client = _client(lambda request: httpx.Response(500))
     with pytest.raises(SensoryError) as caught:
         _provider(client, config=config)
     assert caught.value.code is ErrorCode.CONFIG_INVALID
-    assert message_part not in str(caught.value).lower()
+    assert "temperature" not in str(caught.value).lower()
 
 
 @pytest.mark.parametrize(

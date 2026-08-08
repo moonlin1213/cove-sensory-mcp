@@ -31,9 +31,21 @@ class ExecutedObservation:
 
     observations: dict[Modality, ObservationEnvelope]
     requested_provider: ProviderId
+    requested_model: str
     used_provider: ProviderId | None
+    used_model: str | None
     fallback_used: bool
     failures: tuple[ErrorCode, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionCandidate:
+    """Executor-owned immutable copy of one authorized routing decision."""
+
+    provider_id: ProviderId
+    expected_model: str
+    modalities: frozenset[Modality]
+    is_fallback: bool
 
 
 def _config_error() -> SensoryError:
@@ -49,38 +61,77 @@ def _joint_not_verified_error() -> SensoryError:
 
 def _failure_result(
     requested_provider: ProviderId,
+    requested_model: str,
     failures: list[ErrorCode],
 ) -> ExecutedObservation:
     return ExecutedObservation(
         observations={},
         requested_provider=requested_provider,
+        requested_model=requested_model,
         used_provider=None,
+        used_model=None,
         fallback_used=False,
         failures=tuple(failures),
     )
 
 
 def _result_is_exact(
-    result: ProviderCallResult,
-    candidate: ProviderCandidate,
+    result: object,
+    candidate: _ExecutionCandidate,
     requested_modalities: frozenset[Modality],
-) -> bool:
-    """Validate identity and the full modality map at the adapter boundary."""
-    if result.provider_id != candidate.provider_id:
-        return False
-    if not isinstance(result.observations, dict):
-        return False
+) -> dict[Modality, ObservationEnvelope] | None:
+    """Validate and copy one exact adapter result inside a sanitized boundary."""
+    if type(result) is not ProviderCallResult:
+        return None
+    if (
+        type(result.provider_id) is not str
+        or result.provider_id != candidate.provider_id
+        or type(result.model) is not str
+        or result.model != candidate.expected_model
+        or type(result.observations) is not dict
+    ):
+        return None
     if frozenset(result.observations) != requested_modalities:
-        return False
-    return all(
-        isinstance(observation, ObservationEnvelope)
-        and observation.modality is modality
-        for modality, observation in result.observations.items()
+        return None
+    copied: dict[Modality, ObservationEnvelope] = {}
+    for modality, observation in result.observations.items():
+        if (
+            type(modality) is not Modality
+            or type(observation) is not ObservationEnvelope
+            or observation.modality is not modality
+        ):
+            return None
+        copied[modality] = observation
+    return copied
+
+
+def _snapshot_candidate(candidate: object) -> _ExecutionCandidate:
+    """Copy only the exact immutable route shape emitted by ProviderRouter."""
+    if type(candidate) is not ProviderCandidate:
+        raise _config_error()
+    if (
+        type(candidate.provider_id) is not str
+        or not candidate.provider_id
+        or len(candidate.provider_id) > 64
+        or type(candidate.expected_model) is not str
+        or not candidate.expected_model
+        or len(candidate.expected_model) > 256
+        or type(candidate.modalities) is not frozenset
+        or not candidate.modalities
+        or any(type(modality) is not Modality for modality in candidate.modalities)
+        or type(candidate.is_fallback) is not bool
+    ):
+        raise _config_error()
+    return _ExecutionCandidate(
+        provider_id=candidate.provider_id,
+        expected_model=candidate.expected_model,
+        modalities=frozenset(tuple(candidate.modalities)),
+        is_fallback=candidate.is_fallback,
     )
 
 
 def _validate_candidates(
-    candidates: list[ProviderCandidate],
+    candidates: tuple[_ExecutionCandidate, ...],
     requested_modalities: frozenset[Modality],
 ) -> None:
     if not candidates:
@@ -117,17 +168,27 @@ class ProviderExecutor:
     def _candidates(
         self,
         requested_modalities: frozenset[Modality],
-    ) -> list[ProviderCandidate]:
+    ) -> tuple[_ExecutionCandidate, ...]:
         if not requested_modalities:
             raise _config_error()
-        if len(requested_modalities) == 1:
-            modality = next(iter(requested_modalities))
-            candidates = self._router.candidates(modality)
-        else:
-            joint = self._router.joint_candidate(requested_modalities)
-            if joint is None:
-                raise _joint_not_verified_error()
-            candidates = [joint]
+        try:
+            if len(requested_modalities) == 1:
+                modality = next(iter(requested_modalities))
+                routed = self._router.candidates(modality)
+                if type(routed) is not list:
+                    raise _config_error()
+                candidates = tuple(
+                    _snapshot_candidate(candidate) for candidate in tuple(routed)
+                )
+            else:
+                joint = self._router.joint_candidate(requested_modalities)
+                if joint is None:
+                    raise _joint_not_verified_error()
+                candidates = (_snapshot_candidate(joint),)
+        except SensoryError:
+            raise
+        except Exception:  # noqa: BLE001 - sanitize a malformed router boundary
+            raise _config_error() from None
         _validate_candidates(candidates, requested_modalities)
         return candidates
 
@@ -142,6 +203,7 @@ class ProviderExecutor:
 
         candidates = self._candidates(requested_modalities)
         requested_provider = candidates[0].provider_id
+        requested_model = candidates[0].expected_model
         failures: list[ErrorCode] = []
 
         for index, candidate in enumerate(candidates):
@@ -153,26 +215,52 @@ class ProviderExecutor:
             except SensoryError as error:
                 failures.append(error.code)
                 if not _can_fallback(error):
-                    return _failure_result(requested_provider, failures)
+                    return _failure_result(
+                        requested_provider,
+                        requested_model,
+                        failures,
+                    )
                 if index + 1 >= len(candidates):
                     if len(candidates) == 1:
                         failures.append(ErrorCode.FALLBACK_NOT_AUTHORIZED)
-                    return _failure_result(requested_provider, failures)
+                    return _failure_result(
+                        requested_provider,
+                        requested_model,
+                        failures,
+                    )
                 continue
             except Exception:  # noqa: BLE001 - sanitize an invalid adapter boundary
                 failures.append(ErrorCode.PROVIDER_UNAVAILABLE)
-                return _failure_result(requested_provider, failures)
+                return _failure_result(
+                    requested_provider,
+                    requested_model,
+                    failures,
+                )
 
-            if not _result_is_exact(result, candidate, requested_modalities):
+            try:
+                observations = _result_is_exact(
+                    result,
+                    candidate,
+                    requested_modalities,
+                )
+            except Exception:  # noqa: BLE001 - sanitize malformed result properties
+                observations = None
+            if observations is None:
                 failures.append(ErrorCode.PROVIDER_CAPABILITY_REJECTED)
-                return _failure_result(requested_provider, failures)
+                return _failure_result(
+                    requested_provider,
+                    requested_model,
+                    failures,
+                )
 
             return ExecutedObservation(
-                observations=dict(result.observations),
+                observations=observations,
                 requested_provider=requested_provider,
+                requested_model=requested_model,
                 used_provider=candidate.provider_id,
+                used_model=candidate.expected_model,
                 fallback_used=candidate.is_fallback,
                 failures=tuple(failures),
             )
 
-        return _failure_result(requested_provider, failures)
+        return _failure_result(requested_provider, requested_model, failures)

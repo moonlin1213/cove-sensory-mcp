@@ -31,6 +31,7 @@ _DEFAULT_TIMEOUT_SECONDS = 120.0
 _MAX_MODEL_LENGTH = 256
 _MAX_TEMPERATURE = 1.0
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_MAX_RESPONSE_BYTES_TEXT = str(_MAX_RESPONSE_BYTES)
 _MAX_CONTENT_BLOCKS = 64
 _MAX_TEXT_BLOCK_CHARS = 2_000_000
 _MAX_COMBINED_TEXT_CHARS = 2_000_000
@@ -171,22 +172,35 @@ def _decode_response_payload(body: bytes) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _declared_content_length(response: httpx.Response) -> int | None:
+def _validate_content_encoding(response: httpx.Response) -> None:
+    encodings = response.headers.get_list("content-encoding")
+    if encodings and encodings != ["identity"]:
+        raise _ResponseReadRejected
+
+
+def _declared_content_length(response: httpx.Response) -> None:
     raw_length = response.headers.get("content-length")
     if raw_length is None:
-        return None
-    if not raw_length.isascii() or not raw_length.isdigit():
+        return
+    if (
+        len(raw_length) > len(_MAX_RESPONSE_BYTES_TEXT)
+        or not raw_length.isascii()
+        or not raw_length.isdigit()
+    ):
         raise _ResponseReadRejected
-    content_length = int(raw_length)
-    if content_length > _MAX_RESPONSE_BYTES:
+    normalized = raw_length.lstrip("0") or "0"
+    if len(normalized) > len(_MAX_RESPONSE_BYTES_TEXT) or (
+        len(normalized) == len(_MAX_RESPONSE_BYTES_TEXT)
+        and normalized > _MAX_RESPONSE_BYTES_TEXT
+    ):
         raise _ResponseReadRejected
-    return content_length
 
 
 async def _read_bounded_response(response: httpx.Response) -> bytes:
+    _validate_content_encoding(response)
     _declared_content_length(response)
     body = bytearray()
-    async for chunk in response.aiter_bytes():
+    async for chunk in response.aiter_raw():
         if len(chunk) > _MAX_RESPONSE_BYTES - len(body):
             raise _ResponseReadRejected
         body.extend(chunk)
@@ -285,7 +299,10 @@ class MiniMaxM3Provider:
         self._base_url = config.base_url or regional_base_url
         self._endpoint = f"{self._base_url}{_ANTHROPIC_MESSAGES_PATH}"
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(follow_redirects=False)
+        self._client = client or httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+        )
 
     @staticmethod
     def _validate_settings(
@@ -319,6 +336,7 @@ class MiniMaxM3Provider:
 
     def _headers(self, credential: str) -> dict[str, str]:
         headers = {
+            "accept-encoding": "identity",
             "anthropic-version": _ANTHROPIC_VERSION,
             "content-type": "application/json",
         }

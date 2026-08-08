@@ -10,16 +10,18 @@ import shutil
 import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
+from typing import Literal, cast
 
 from pydantic import TypeAdapter
 
 from . import __version__
 from .config.paths import AppPaths
-from .config.schema import AppConfig, ProviderConfig
+from .config.schema import AdapterOptions, AppConfig, ProviderConfig
 from .config.secrets import KeyringSecretStore
 from .config.store import ConfigStore
 from .errors import ErrorCode, SensoryError
 from .models import Modality, ProviderId, ProviderRef, RouteConfig
+from .providers.openai_compatible import media_part_mode_capabilities
 from .server import run_stdio
 from .services import AppServices
 from .tools.setup import sensory_self_test, verify_provider_capabilities
@@ -32,9 +34,15 @@ ConfigureVerifyFn = Callable[
 ]
 
 _MINIMAX_BASE_URLS = {
-    "cn": "https://api.minimaxi.com/v1",
-    "global": "https://api.minimax.io/v1",
+    "cn": "https://api.minimaxi.com",
+    "global": "https://api.minimax.io",
 }
+CustomMediaPartMode = Literal[
+    "image_url_data_uri",
+    "input_audio_base64",
+    "video_url_data_uri",
+    "anthropic_base64_media",
+]
 _PROVIDER_ID_ADAPTER = TypeAdapter(ProviderId)
 _CANCEL_VALUES = frozenset({"cancel", "quit", "q"})
 _CONFIG_CHANGED_MESSAGE = "The configuration changed before the update completed."
@@ -42,6 +50,10 @@ _CONFIG_CHANGED_MESSAGE = "The configuration changed before the update completed
 
 class _ConfigurationCancelled(Exception):
     """Stop the local wizard before either persistent store is changed."""
+
+
+class _CustomWireModeMismatch(ValueError):
+    """Require separate Provider IDs for incompatible custom wire contracts."""
 
 
 def _optional_environment_path(name: str) -> Path | None:
@@ -154,6 +166,16 @@ def _provider_from_answers(
             _clean_answer(input_fn, "Credential reference (or env:VARIABLE_NAME): ")
         )
         base_url = _clean_answer(input_fn, "HTTPS base URL: ")
+        endpoint_path = _clean_answer(input_fn, "Relative endpoint path: ")
+        media_part_mode_value = _clean_answer(
+            input_fn,
+            "Media part mode [image_url_data_uri/input_audio_base64/"
+            "video_url_data_uri/anthropic_base64_media]: ",
+        ).lower()
+        supported_capabilities = media_part_mode_capabilities(media_part_mode_value)
+        if supported_capabilities is None:
+            raise ValueError("invalid media part mode")
+        media_part_mode = cast(CustomMediaPartMode, media_part_mode_value)
         model = _validated_model(_clean_answer(input_fn, "Model: "))
         declared = _declared_capabilities(
             _clean_answer(
@@ -162,6 +184,11 @@ def _provider_from_answers(
                 "video_audio, audio, music): ",
             )
         )
+        selected = frozenset(
+            modality for modality, enabled in declared.items() if enabled
+        )
+        if not selected <= supported_capabilities:
+            raise _CustomWireModeMismatch
         provider = ProviderConfig(
             adapter="openai-compatible",
             base_url=base_url,
@@ -169,6 +196,10 @@ def _provider_from_answers(
             credential_ref=credential_ref,
             api_key_env=api_key_env,
             declared_capabilities=declared,
+            adapter_options=AdapterOptions(
+                endpoint_path=endpoint_path,
+                media_part_mode=media_part_mode,
+            ),
         )
         return provider_id, provider
 
@@ -330,6 +361,13 @@ def run_configure(
             ear = _optional_yes(input_fn, "Use this Provider as the ear? [y/N]: ")
     except (EOFError, KeyboardInterrupt, StopIteration, _ConfigurationCancelled):
         output("Configuration cancelled; nothing was saved.")
+        return 1
+    except _CustomWireModeMismatch:
+        output(
+            "Configuration was not saved: one custom wire mode cannot carry every "
+            "declared capability. Create multiple Provider IDs for incompatible wire "
+            "modes."
+        )
         return 1
     except (SensoryError, ValueError):
         output("Configuration was not saved: one or more settings are invalid.")

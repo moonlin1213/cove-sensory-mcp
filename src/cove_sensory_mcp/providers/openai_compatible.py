@@ -196,6 +196,13 @@ _MODE_CAPABILITIES = {
 }
 
 
+def media_part_mode_capabilities(mode: object) -> frozenset[Modality] | None:
+    """Return the immutable capability boundary for one supported wire mode."""
+    if type(mode) is not str:
+        return None
+    return _MODE_CAPABILITIES.get(mode)
+
+
 def _request_is_compatible(
     request: ProviderRequest,
     mode: str,

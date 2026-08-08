@@ -13,7 +13,11 @@ from cove_sensory_mcp.errors import ErrorCode, SensoryError, error_result
 from cove_sensory_mcp.models import CapabilityStatus, Modality, SensoryStatus
 from cove_sensory_mcp.providers.base import SensoryProvider, VerificationResult
 from cove_sensory_mcp.providers.gemini import GeminiProvider
-from cove_sensory_mcp.providers.minimax_m3 import MiniMaxM3Provider, MiniMaxRegion
+from cove_sensory_mcp.providers.minimax_m3 import (
+    MINIMAX_CN_BASE_URL,
+    MiniMaxM3Provider,
+    MiniMaxRegion,
+)
 from cove_sensory_mcp.providers.openai_compatible import OpenAICompatibleProvider
 from cove_sensory_mcp.providers.registry import ProviderRegistry
 from cove_sensory_mcp.services import AppServices
@@ -219,7 +223,7 @@ def _provider_adapter(
     if config.adapter == "minimax-m3":
         region = (
             MiniMaxRegion.CN
-            if config.base_url == "https://api.minimaxi.com/v1"
+            if config.base_url == MINIMAX_CN_BASE_URL
             else MiniMaxRegion.GLOBAL
         )
         return MiniMaxM3Provider(

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
+import inspect
 import json
 import logging
+import zlib
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, cast
@@ -179,8 +182,21 @@ def _client(
     *,
     follow_redirects: bool = False,
 ) -> httpx.AsyncClient:
+    async def streaming_handler(request: httpx.Request) -> object:
+        response = handler(request)
+        if inspect.isawaitable(response):
+            response = await response
+        if isinstance(response, httpx.Response) and response.is_stream_consumed:
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers.raw,
+                stream=TrackingAsyncStream([response.content]),
+                extensions=response.extensions,
+            )
+        return response
+
     return httpx.AsyncClient(
-        transport=httpx.MockTransport(cast(Any, handler)),
+        transport=httpx.MockTransport(cast(Any, streaming_handler)),
         follow_redirects=follow_redirects,
     )
 
@@ -252,6 +268,7 @@ async def test_image_uses_exact_anthropic_base64_media_payload(tmp_path: Path) -
     }
     prompt = payload["messages"][0]["content"][1]["text"]
     assert 'exactly: ["image"]' in prompt
+    assert captured[0].headers["accept-encoding"] == "identity"
     assert result.provider_id == "minimax"
     assert result.model == "MiniMax-M3"
     assert result.remote_file_deleted is None
@@ -948,7 +965,11 @@ async def test_streamed_response_without_content_length_is_bounded_and_closed(
     stream = TrackingAsyncStream([body[:17], body[17:]])
 
     async with _client(
-        lambda request: httpx.Response(200, stream=stream)
+        lambda request: httpx.Response(
+            200,
+            headers={"content-encoding": "identity"},
+            stream=stream,
+        )
     ) as client:
         result = await _provider(client).sense(
             _request(
@@ -961,6 +982,129 @@ async def test_streamed_response_without_content_length_is_bounded_and_closed(
 
     assert result.observations[Modality.IMAGE].summary == "Direct evidence."
     assert stream.yielded_chunks == 2
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    "encoding_headers",
+    [
+        pytest.param([(b"content-encoding", b"")], id="empty"),
+        pytest.param(
+            [(b"content-encoding", b"identity, identity")],
+            id="identity-list",
+        ),
+        pytest.param(
+            [
+                (b"content-encoding", b"identity"),
+                (b"content-encoding", b"identity"),
+            ],
+            id="duplicate-identity-fields",
+        ),
+        pytest.param(
+            [(b"content-encoding", b"identity, gzip")],
+            id="mixed-list",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("http_status", "want_code", "want_retryable"),
+    [
+        (200, ErrorCode.PROVIDER_CAPABILITY_REJECTED, False),
+        (503, ErrorCode.PROVIDER_UNAVAILABLE, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_exact_identity_content_encoding_is_rejected_before_iteration(
+    tmp_path: Path,
+    encoding_headers: list[tuple[bytes, bytes]],
+    http_status: int,
+    want_code: ErrorCode,
+    want_retryable: bool,
+) -> None:
+    """Empty, repeated, or listed encodings must not enter the raw response reader."""
+    image = tmp_path / "invalid-encoding.jpg"
+    image.write_bytes(b"image")
+    stream = TrackingAsyncStream([_response_bytes()])
+
+    async with _client(
+        lambda request: httpx.Response(
+            http_status,
+            headers=encoding_headers,
+            stream=stream,
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is want_code
+    assert caught.value.retryable is want_retryable
+    assert stream.iterated is False
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "compress"),
+    [
+        ("gzip", gzip.compress),
+        ("deflate", zlib.compress),
+    ],
+)
+@pytest.mark.parametrize(
+    ("http_status", "want_code", "want_retryable"),
+    [
+        (200, ErrorCode.PROVIDER_CAPABILITY_REJECTED, False),
+        (503, ErrorCode.PROVIDER_UNAVAILABLE, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_compressed_amplification_is_rejected_without_decompression(
+    tmp_path: Path,
+    content_encoding: str,
+    compress: Callable[[bytes], bytes],
+    http_status: int,
+    want_code: ErrorCode,
+    want_retryable: bool,
+) -> None:
+    """A tiny compressed body must not inflate beyond the raw eight-MiB boundary."""
+    image = tmp_path / f"{content_encoding}-amplification.jpg"
+    image.write_bytes(b"image")
+    private_marker = b"private-decompressed-response-marker"
+    expanded = private_marker + b"x" * _MAX_RESPONSE_BYTES_TEST
+    compressed = compress(expanded)
+    assert len(compressed) < _MAX_RESPONSE_BYTES_TEST
+    stream = TrackingAsyncStream([compressed])
+
+    async with _client(
+        lambda request: httpx.Response(
+            http_status,
+            headers={
+                "content-encoding": content_encoding,
+                "content-length": str(len(compressed)),
+            },
+            stream=stream,
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client).sense(
+                _request(
+                    image,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modalities=frozenset({Modality.IMAGE}),
+                )
+            )
+
+    assert caught.value.code is want_code
+    assert caught.value.retryable is want_retryable
+    assert private_marker.decode("ascii") not in str(caught.value)
+    assert stream.iterated is False
     assert stream.closed is True
 
 
@@ -1007,7 +1151,10 @@ async def test_oversized_content_length_closes_without_reading_body(tmp_path: Pa
     async with _client(
         lambda request: httpx.Response(
             200,
-            headers={"content-length": str(_MAX_RESPONSE_BYTES_TEST + 1)},
+            headers={
+                "content-encoding": "identity",
+                "content-length": str(_MAX_RESPONSE_BYTES_TEST + 1),
+            },
             stream=stream,
         )
     ) as client:
@@ -1064,7 +1211,11 @@ async def test_chunked_response_stops_at_cumulative_byte_cap_and_closes(
     )
 
     async with _client(
-        lambda request: httpx.Response(http_status, stream=stream)
+        lambda request: httpx.Response(
+            http_status,
+            headers={"content-encoding": "identity"},
+            stream=stream,
+        )
     ) as client:
         with pytest.raises(SensoryError) as caught:
             await _provider(client).sense(
@@ -1606,3 +1757,59 @@ async def test_provider_closes_the_async_client_it_constructs(
     await provider.aclose()
 
     assert owned.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_owned_client_ignores_hostile_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient HTTPS, all-protocol, or SOCKS proxies must not receive Provider media."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.invalid:8443")
+    monkeypatch.setenv("ALL_PROXY", "http://all-proxy.example.invalid:8080")
+    monkeypatch.setenv("SOCKS_PROXY", "socks5://socks.example.invalid:1080")
+    owned = _client(lambda request: httpx.Response(500))
+    construction_options: dict[str, object] = {}
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        construction_options.update(kwargs)
+        return owned
+
+    monkeypatch.setattr(httpx, "AsyncClient", fake_async_client)
+    provider = MiniMaxM3Provider(
+        provider_id="minimax",
+        config=_config(),
+        secret_store=_store(),
+    )
+
+    assert construction_options == {
+        "follow_redirects": False,
+        "trust_env": False,
+    }
+    await provider.aclose()
+    assert owned.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_borrowed_client_is_not_reconstructed_under_hostile_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dependency-injected transport policy belongs to the caller and stays borrowed."""
+    borrowed = _client(lambda request: httpx.Response(500))
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.invalid:8443")
+    monkeypatch.setenv("ALL_PROXY", "socks5://all-proxy.example.invalid:1080")
+    monkeypatch.setenv("SOCKS_PROXY", "socks5://socks.example.invalid:1080")
+
+    def unexpected_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        pytest.fail("a borrowed MiniMax client was reconstructed")
+
+    monkeypatch.setattr(httpx, "AsyncClient", unexpected_client)
+    provider = MiniMaxM3Provider(
+        provider_id="minimax",
+        config=_config(),
+        secret_store=_store(),
+        client=borrowed,
+    )
+
+    await provider.aclose()
+    assert borrowed.is_closed is False
+    await borrowed.aclose()

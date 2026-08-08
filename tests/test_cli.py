@@ -1,9 +1,12 @@
+import json
 import subprocess
 import sys
 import tempfile
+from collections.abc import AsyncIterator
 from importlib.metadata import requires, version
 from pathlib import Path
 
+import httpx
 import keyring
 import pytest
 
@@ -20,8 +23,27 @@ from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig
 from cove_sensory_mcp.config.secrets import MemorySecretStore
 from cove_sensory_mcp.config.store import ConfigStore
 from cove_sensory_mcp.errors import ErrorCode, SensoryError
-from cove_sensory_mcp.models import Modality, RouteConfig
+from cove_sensory_mcp.models import DetailLevel, Modality, RouteConfig
+from cove_sensory_mcp.providers.base import MediaKind, PreparedMedia, ProviderRequest
 from cove_sensory_mcp.services import AppServices
+from cove_sensory_mcp.tools.setup import _provider_adapter, verify_provider_capabilities
+from cove_sensory_mcp.verification.assets import SelfTestAssetStore
+
+
+class _StaticAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._body
+
+
+def _streaming_json_response(payload: object) -> httpx.Response:
+    return httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        stream=_StaticAsyncStream(json.dumps(payload).encode("utf-8")),
+    )
 
 
 def test_self_test_refusal_makes_no_provider_call_or_config_write(
@@ -634,14 +656,19 @@ def test_configure_rejects_invalid_environment_reference_without_persistence(
 @pytest.mark.parametrize(
     ("region", "expected_base_url"),
     [
-        ("cn", "https://api.minimaxi.com/v1"),
-        ("global", "https://api.minimax.io/v1"),
+        ("cn", "https://api.minimaxi.com"),
+        ("global", "https://api.minimax.io"),
     ],
 )
-def test_configure_minimax_region_selects_non_secret_base_url(
-    tmp_services: AppServices, region: str, expected_base_url: str
+@pytest.mark.asyncio
+async def test_configure_minimax_region_reaches_exact_anthropic_messages_url(
+    tmp_services: AppServices,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    region: str,
+    expected_base_url: str,
 ) -> None:
-    """Mapping a region to the wrong host would send later media to the wrong endpoint."""
+    """Saving a version prefix as the host root would call a nonexistent /v1/anthropic path."""
     answers = iter(["minimax-m3", "minimax-main", region, "MiniMax-M3", "n"])
 
     assert (
@@ -657,6 +684,59 @@ def test_configure_minimax_region_selects_non_secret_base_url(
     provider = tmp_services.config_store.load().providers["minimax-m3"]
     assert provider.adapter == "minimax-m3"
     assert provider.base_url == expected_base_url
+
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        report = {
+            "observations": [
+                {
+                    "modality": "image",
+                    "summary": "A blue triangle is visible.",
+                    "segments": [],
+                    "transcript": [],
+                    "warnings": [],
+                    "confidence": "high",
+                }
+            ]
+        }
+        return _streaming_json_response(
+            {
+                "content": [{"type": "text", "text": json.dumps(report)}],
+                "base_resp": {"status_code": 0, "status_msg": "success"},
+            }
+        )
+
+    owned_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+    construction_options: dict[str, object] = {}
+
+    def owned_client_factory(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        construction_options.update(kwargs)
+        return owned_client
+
+    monkeypatch.setattr(httpx, "AsyncClient", owned_client_factory)
+    adapter = _provider_adapter("minimax-m3", provider, tmp_services)
+    image = tmp_path / f"{region}-region.png"
+    image.write_bytes(b"tiny-image")
+    try:
+        await adapter.sense(
+            ProviderRequest(
+                media=PreparedMedia(image, "image/png", MediaKind.IMAGE, None),
+                requested_modalities=frozenset({Modality.IMAGE}),
+                question="",
+                detail=DetailLevel.QUICK,
+                language="en",
+            )
+        )
+    finally:
+        await adapter.aclose()  # type: ignore[attr-defined]
+
+    assert requested_urls == [f"{expected_base_url}/anthropic/v1/messages"]
+    assert construction_options["trust_env"] is False
 
 
 def test_configure_minimax_custom_endpoint_rejects_secret_bearing_url(
@@ -756,9 +836,12 @@ def test_configure_custom_provider_saves_only_declared_supported_capabilities(
             "custom",
             "studio-sense",
             "studio-sense-key",
-            "https://api.example.test/v1",
+            "https://api.example.test",
+            "/v1/chat/completions",
+            "input_audio_base64",
             "sense-model",
-            "image,audio,music",
+            "audio,music",
+            "n",
             "n",
         ]
     )
@@ -775,8 +858,10 @@ def test_configure_custom_provider_saves_only_declared_supported_capabilities(
 
     provider = tmp_services.config_store.load().providers["studio-sense"]
     assert provider.adapter == "openai-compatible"
+    assert provider.adapter_options.endpoint_path == "/v1/chat/completions"
+    assert provider.adapter_options.media_part_mode == "input_audio_base64"
     assert provider.declared_capabilities == {
-        "image": True,
+        "image": False,
         "video_visual": False,
         "video_audio": False,
         "audio": True,
@@ -796,10 +881,11 @@ def test_configure_rejects_unknown_custom_capability_without_saving(
             "custom",
             "studio-sense",
             "studio-sense-key",
-            "https://api.example.test/v1",
+            "https://api.example.test",
+            "/v1/chat/completions",
+            "image_url_data_uri",
             "sense-model",
             "image,telepathy",
-            "n",
         ]
     )
 
@@ -815,6 +901,235 @@ def test_configure_rejects_unknown_custom_capability_without_saving(
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
+
+
+def test_configure_custom_rejects_capabilities_outside_one_wire_mode(
+    tmp_services: AppServices,
+) -> None:
+    """Saving incompatible capabilities would defer a local CONFIG_INVALID until self-test."""
+    answers = iter(
+        [
+            "custom",
+            "mixed-wire-provider",
+            "mixed-wire-key",
+            "https://api.example.test",
+            "/v1/chat/completions",
+            "image_url_data_uri",
+            "sense-model",
+            "image,audio",
+        ]
+    )
+    messages: list[str] = []
+
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: pytest.fail(
+                "an incompatible wire contract prompted for a credential"
+            ),
+            output=messages.append,
+        )
+        == 1
+    )
+    assert not tmp_services.config_store.path.exists()
+    assert "multiple provider ids" in " ".join(messages).lower()
+
+
+@pytest.mark.parametrize(
+    ("mode", "capability", "media_kind", "mime_type"),
+    [
+        ("image_url_data_uri", Modality.IMAGE, MediaKind.IMAGE, "image/png"),
+        ("input_audio_base64", Modality.AUDIO, MediaKind.AUDIO, "audio/wav"),
+        (
+            "video_url_data_uri",
+            Modality.VIDEO_VISUAL,
+            MediaKind.VIDEO,
+            "video/mp4",
+        ),
+        ("anthropic_base64_media", Modality.IMAGE, MediaKind.IMAGE, "image/png"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_custom_cli_wire_mode_reaches_constructed_adapter_call(
+    tmp_services: AppServices,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    capability: Modality,
+    media_kind: MediaKind,
+    mime_type: str,
+) -> None:
+    """Dropping either custom option would fail locally before the configured endpoint call."""
+    provider_id = f"custom-{mode.replace('_', '-')}"
+    answers = iter(
+        [
+            "custom",
+            provider_id,
+            f"{provider_id}-key",
+            "https://custom.example.test/api",
+            "/v1/chat/completions",
+            mode,
+            "custom-model",
+            capability.value,
+            "n",
+            "n",
+        ]
+    )
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "custom-secret-not-for-output",
+            output=lambda _: None,
+        )
+        == 0
+    )
+    config = tmp_services.config_store.load().providers[provider_id]
+    assert config.adapter_options.endpoint_path == "/v1/chat/completions"
+    assert config.adapter_options.media_part_mode == mode
+
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return _streaming_json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "observations": [
+                                        {
+                                            "modality": capability.value,
+                                            "summary": "Direct evidence.",
+                                            "segments": [],
+                                            "transcript": [],
+                                            "warnings": [],
+                                            "confidence": "medium",
+                                        }
+                                    ]
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+    owned_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), trust_env=False
+    )
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: owned_client,
+    )
+    adapter = _provider_adapter(provider_id, config, tmp_services)
+    media = tmp_path / f"fixture-{mode}.bin"
+    media.write_bytes(b"tiny-media")
+    try:
+        result = await adapter.sense(
+            ProviderRequest(
+                media=PreparedMedia(media, mime_type, media_kind, 1.0),
+                requested_modalities=frozenset({capability}),
+                question="",
+                detail=DetailLevel.QUICK,
+                language="en",
+            )
+        )
+    finally:
+        await adapter.aclose()  # type: ignore[attr-defined]
+
+    assert result.observations[capability].summary == "Direct evidence."
+    assert requested_urls == [
+        "https://custom.example.test/api/v1/chat/completions"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_custom_cli_image_mode_reaches_capability_self_test(
+    tmp_services: AppServices,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete custom wizard result must verify instead of returning CONFIG_INVALID."""
+    answers = iter(
+        [
+            "custom",
+            "custom-self-test",
+            "custom-self-test-key",
+            "https://custom.example.test",
+            "/v1/chat/completions",
+            "image_url_data_uri",
+            "custom-model",
+            "image",
+            "y",
+            "n",
+            "n",
+        ]
+    )
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "custom-self-test-secret",
+            output=lambda _: None,
+        )
+        == 0
+    )
+    image = tmp_path / "self-test.png"
+    image.write_bytes(b"tiny-image")
+    assets = SelfTestAssetStore(
+        {
+            Modality.IMAGE: PreparedMedia(
+                image, "image/png", MediaKind.IMAGE, None
+            )
+        },
+        trusted_root=tmp_path,
+    )
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        report = {
+            "observations": [
+                {
+                    "modality": "image",
+                    "summary": "A blue triangle is centered on a white background.",
+                    "segments": [],
+                    "transcript": [],
+                    "warnings": [],
+                    "confidence": "high",
+                }
+            ]
+        }
+        return _streaming_json_response(
+            {"choices": [{"message": {"content": json.dumps(report)}}]}
+        )
+
+    owned_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), trust_env=False
+    )
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: owned_client,
+    )
+
+    result = await verify_provider_capabilities(
+        tmp_services,
+        "custom-self-test",
+        [Modality.IMAGE],
+        assets=assets,
+    )
+
+    assert result["status"] == "ok", result
+    assert requested_urls == ["https://custom.example.test/v1/chat/completions"]
+    assert tmp_services.config_store.load().providers[
+        "custom-self-test"
+    ].verified_capabilities[Modality.IMAGE] is True
 
 
 @pytest.mark.parametrize("cancel_value", ["cancel", "quit", "q"])
@@ -845,7 +1160,28 @@ def test_configure_rejects_unknown_custom_capability_without_saving(
                 "custom",
                 "studio-sense",
                 "studio-sense-key",
-                "https://api.example.test/v1",
+                "https://api.example.test",
+            ],
+            id="custom-endpoint-path",
+        ),
+        pytest.param(
+            [
+                "custom",
+                "studio-sense",
+                "studio-sense-key",
+                "https://api.example.test",
+                "/v1/chat/completions",
+            ],
+            id="custom-media-part-mode",
+        ),
+        pytest.param(
+            [
+                "custom",
+                "studio-sense",
+                "studio-sense-key",
+                "https://api.example.test",
+                "/v1/chat/completions",
+                "image_url_data_uri",
             ],
             id="custom-model",
         ),
@@ -854,7 +1190,9 @@ def test_configure_rejects_unknown_custom_capability_without_saving(
                 "custom",
                 "studio-sense",
                 "studio-sense-key",
-                "https://api.example.test/v1",
+                "https://api.example.test",
+                "/v1/chat/completions",
+                "image_url_data_uri",
                 "sense-model",
             ],
             id="custom-capabilities",

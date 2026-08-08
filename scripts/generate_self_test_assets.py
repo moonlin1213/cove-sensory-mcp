@@ -37,41 +37,56 @@ def _write_wav(path: Path, seconds: float, sample: Callable[[float], float]) -> 
         target.writeframes(frames)
 
 
-def _speech_sample(t: float) -> float:
-    """Small formant-style synthetic phrase followed by an 880 Hz confirmation tone."""
-    if t >= 1.55:
-        return 0.45 * math.sin(2 * math.pi * 880 * t)
-    syllable = min(4, int(t / 0.31))
-    local = t - syllable * 0.31
-    if local > 0.24:
-        return 0.0
-    fundamental = (120, 145, 165, 195, 220)[syllable]
-    envelope = min(local / 0.025, 1.0) * min((0.24 - local) / 0.04, 1.0)
-    return envelope * (
-        0.42 * math.sin(2 * math.pi * fundamental * t)
-        + 0.18 * math.sin(2 * math.pi * fundamental * 3 * t)
-        + 0.12 * math.sin(2 * math.pi * fundamental * 7 * t)
-    )
+def _beep_sample(t: float) -> float:
+    """Three separated 880 Hz beeps for the hearing self-test."""
+    for start in (0.15, 0.75, 1.35):
+        local = t - start
+        if 0 <= local < 0.25:
+            envelope = min(local / 0.015, 1.0) * min((0.25 - local) / 0.025, 1.0)
+            return 0.55 * envelope * math.sin(2 * math.pi * 880 * local)
+    return 0.0
+
+
+def _bell_sample(t: float) -> float:
+    """Two separated synthetic bell chimes for the video-hearing self-test."""
+    for start in (0.20, 1.10):
+        local = t - start
+        if 0 <= local < 0.45:
+            envelope = min(local / 0.008, 1.0) * math.exp(-5.5 * local)
+            return envelope * (
+                0.42 * math.sin(2 * math.pi * 660 * local)
+                + 0.24 * math.sin(2 * math.pi * 990 * local)
+                + 0.14 * math.sin(2 * math.pi * 1_430 * local)
+            )
+    return 0.0
 
 
 def _music_sample(t: float) -> float:
-    beat = int(t * 4) if t < 1.5 else int((t - 1.5) * 8)
-    pulse = 1.0 if (t * (4 if t < 1.5 else 8)) % 1 < 0.22 else 0.45
-    notes = (440.0, 554.365, 659.255, 554.365)
-    tone = notes[beat % len(notes)]
-    return pulse * (
-        0.38 * math.sin(2 * math.pi * tone * t)
-        + 0.22 * math.sin(2 * math.pi * 330 * t)
+    """Four piano-like notes forming one unambiguous ascending scale."""
+    notes = (261.626, 329.628, 391.995, 523.251)
+    note_index = min(3, int(t / 0.75))
+    local = t - note_index * 0.75
+    tone = notes[note_index]
+    envelope = min(local / 0.012, 1.0) * math.exp(-1.8 * local)
+    return envelope * (
+        0.48 * math.sin(2 * math.pi * tone * local)
+        + 0.16 * math.sin(2 * math.pi * tone * 2 * local)
+        + 0.08 * math.sin(2 * math.pi * tone * 3 * local)
     )
 
 
-def _draw_frame(index: int, *, text: bool) -> Image.Image:
+def _draw_shape() -> Image.Image:
+    image = Image.new("RGB", (320, 180), (248, 248, 244))
+    draw = ImageDraw.Draw(image)
+    draw.polygon(((160, 45), (105, 135), (215, 135)), fill=(33, 102, 214))
+    return image
+
+
+def _draw_motion_frame(index: int) -> Image.Image:
     image = Image.new("RGB", (320, 180), (248, 248, 244))
     draw = ImageDraw.Draw(image)
     x = 42 + round((320 - 84) * index / 47)
-    draw.ellipse((x - 24, 66, x + 24, 114), fill=(33, 102, 214))
-    if text:
-        draw.text((135, 20), "COVE 3", fill=(20, 20, 20), stroke_width=1)
+    draw.ellipse((x - 24, 66, x + 24, 114), fill=(210, 52, 52))
     return image
 
 
@@ -79,21 +94,25 @@ def generate(output: Path, ffmpeg: str = "ffmpeg") -> dict[str, object]:
     output.mkdir(parents=True, exist_ok=True)
     shape = output / "shape.png"
     pnginfo = PngImagePlugin.PngInfo()
-    _draw_frame(0, text=True).save(shape, format="PNG", optimize=False, pnginfo=pnginfo)
+    _draw_shape().save(shape, format="PNG", optimize=False, pnginfo=pnginfo)
 
     speech = output / "speech.wav"
     music = output / "music.wav"
-    _write_wav(speech, 2.0, _speech_sample)
+    _write_wav(speech, 2.0, _beep_sample)
     _write_wav(music, 3.0, _music_sample)
 
     motion = output / "motion.mp4"
     executable = shutil.which(ffmpeg)
     if executable is None:
-        raise SystemExit("A verified ffmpeg executable is required to generate motion.mp4")
+        raise SystemExit(
+            "A verified ffmpeg executable is required to generate motion.mp4"
+        )
     with tempfile.TemporaryDirectory(prefix="cove-self-test-") as scratch:
         frames = Path(scratch)
+        bell = frames / "bell.wav"
+        _write_wav(bell, 2.0, _bell_sample)
         for index in range(48):
-            _draw_frame(index, text=index >= 24).save(
+            _draw_motion_frame(index).save(
                 frames / f"frame-{index:03d}.png", format="PNG", optimize=False
             )
         subprocess.run(
@@ -108,7 +127,7 @@ def generate(output: Path, ffmpeg: str = "ffmpeg") -> dict[str, object]:
                 "-i",
                 str(frames / "frame-%03d.png"),
                 "-i",
-                str(speech),
+                str(bell),
                 "-t",
                 "2",
                 "-map_metadata",
@@ -131,14 +150,14 @@ def generate(output: Path, ffmpeg: str = "ffmpeg") -> dict[str, object]:
         )
 
     descriptions = {
-        "shape.png": ("image", "image/png", [["blue", "circle"], ["COVE", "3"]]),
+        "shape.png": ("image", "image/png", [["blue", "triangle"]]),
         "motion.mp4": (
             "video_visual",
             "video/mp4",
-            [["blue", "circle", "left", "right"], ["3"]],
+            [["red", "ball", "left", "right"], ["bell", "twice"]],
         ),
-        "speech.wav": ("audio", "audio/wav", [["tone", "880"]]),
-        "music.wav": ("music", "audio/wav", [["tone", "rhythm", "change"]]),
+        "speech.wav": ("audio", "audio/wav", [["tone", "beep", "three"]]),
+        "music.wav": ("music", "audio/wav", [["piano", "ascending", "scale"]]),
     }
     assets = [
         {

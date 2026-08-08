@@ -44,6 +44,18 @@ _EXPECTED_FACT_GROUPS: dict[Modality, tuple[frozenset[str], ...]] = {
     Modality.IMAGE: (
         frozenset({"blue", "azure"}),
         frozenset({"triangle", "triangular"}),
+        frozenset(
+            {
+                "appear",
+                "appears",
+                "centered",
+                "contains",
+                "displays",
+                "shown",
+                "shows",
+                "visible",
+            }
+        ),
     ),
     Modality.VIDEO_VISUAL: (
         frozenset({"red", "crimson"}),
@@ -68,30 +80,36 @@ _EXPECTED_FACT_GROUPS: dict[Modality, tuple[frozenset[str], ...]] = {
         frozenset({"right", "rightward"}),
     ),
     Modality.VIDEO_AUDIO: (
-        frozenset({"bell", "chime"}),
+        frozenset({"bell"}),
+        frozenset({"chime", "chimes", "ring", "rings", "rang", "sounds"}),
         frozenset({"twice", "two", "second"}),
     ),
     Modality.AUDIO: (
-        frozenset({"beep", "tone"}),
+        frozenset({"beep", "beeps", "tone", "tones"}),
+        frozenset({"beeps", "beeping", "sound", "sounds", "plays", "played"}),
         frozenset({"three", "triple"}),
     ),
     Modality.MUSIC: (
         frozenset({"piano", "keyboard"}),
+        frozenset(
+            {"plays", "played", "playing", "rises", "rose", "ascends", "ascended"}
+        ),
         frozenset({"ascending", "rising", "upward"}),
     ),
 }
 
-_NEGATED_VIDEO_MOTION = re.compile(
-    r"\b(?:"
-    r"no\s+(?:visible\s+|discernible\s+)?motion|"
-    r"does(?:\s+not|n't)\s+(?:move|travel|roll|cross)|"
-    r"never\s+(?:moves?|travels?|rolls?|crosses?)|"
-    r"(?:is\s+)?not\s+(?:moving|traveling|travelling|rolling|crossing)|"
-    r"isn't\s+(?:moving|traveling|travelling|rolling|crossing)|"
-    r"stationary|"
-    r"(?:remains?|stays?)\s+still"
-    r")\b"
-)
+_CLAUSE_BOUNDARY = re.compile(r"[.;!?\n]+|\b(?:but|however)\b")
+_TOKEN = re.compile(r"[a-z0-9]+(?:['’][a-z]+)?")
+_NEGATORS = frozenset({"no", "not", "never", "without", "cannot"})
+_CONTRACTIONS: dict[str, tuple[str, ...]] = {
+    "can't": ("cannot",),
+    "cannot": ("cannot",),
+    "doesn't": ("does", "not"),
+    "isn't": ("is", "not"),
+    "wasn't": ("was", "not"),
+    "weren't": ("were", "not"),
+}
+_NEGATION_WINDOW = 6
 
 
 def _config_error() -> SensoryError:
@@ -118,16 +136,46 @@ def _observation_text(observation: ObservationEnvelope) -> str:
     return "\n".join(parts).lower()
 
 
+def _token_clauses(text: str) -> tuple[tuple[str, ...], ...]:
+    """Tokenize local clauses and expand contractions into explicit negation tokens."""
+    clauses: list[tuple[str, ...]] = []
+    for raw_clause in _CLAUSE_BOUNDARY.split(text.replace("’", "'")):
+        tokens: list[str] = []
+        for token in _TOKEN.findall(raw_clause):
+            tokens.extend(_CONTRACTIONS.get(token, (token,)))
+        if tokens:
+            clauses.append(tuple(tokens))
+    return tuple(clauses)
+
+
+def _positive_occurrence(tokens: tuple[str, ...], index: int) -> bool:
+    """Return whether one fact token is outside a nearby negative event scope."""
+    context = tokens[max(0, index - _NEGATION_WINDOW) : index]
+    if any(token in _NEGATORS for token in context):
+        return False
+    for marker in ("fails", "failed"):
+        if marker in context and "to" in context[context.index(marker) + 1 :]:
+            return False
+    return True
+
+
+def _has_positive_term(
+    clauses: tuple[tuple[str, ...], ...],
+    terms: frozenset[str],
+) -> bool:
+    return any(
+        token in terms and _positive_occurrence(tokens, index)
+        for tokens in clauses
+        for index, token in enumerate(tokens)
+    )
+
+
 def _matches_expected_facts(
     modality: Modality, observation: ObservationEnvelope
 ) -> bool:
-    text = _observation_text(observation)
-    if modality is Modality.VIDEO_VISUAL and _NEGATED_VIDEO_MOTION.search(text):
-        return False
-    words = frozenset(re.findall(r"[a-z0-9]+", text))
+    clauses = _token_clauses(_observation_text(observation))
     return all(
-        any(term in words for term in group)
-        for group in _EXPECTED_FACT_GROUPS[modality]
+        _has_positive_term(clauses, group) for group in _EXPECTED_FACT_GROUPS[modality]
     )
 
 

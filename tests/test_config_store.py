@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import threading
+import time
 from pathlib import Path
+from typing import Self
 
 import pytest
 import yaml
@@ -86,7 +89,12 @@ def test_save_replaces_destination_with_temporary_file_atomically(
 
     ConfigStore(path).save(AppConfig())
 
-    assert replaced == [(tmp_path / "config.yaml.tmp", path)]
+    assert len(replaced) == 1
+    temporary, destination = replaced[0]
+    assert temporary.parent == tmp_path
+    assert temporary.name.startswith(".config.yaml.")
+    assert temporary.name.endswith(".tmp")
+    assert destination == path
     assert (
         path.read_text(encoding="utf-8")
         == "version: 1\nproviders: {}\nroutes: {}\nlimits: {}\nallowed_media_roots: []\n"
@@ -157,6 +165,80 @@ def test_two_store_instances_merge_racing_provider_route_and_settings_updates(
     assert saved.allowed_media_roots == ["D:/Shared Media"]
 
 
+@pytest.mark.parametrize("operation", ["load", "save", "update"])
+@pytest.mark.parametrize("use_peer", [False, True], ids=["same-store", "peer-store"])
+def test_same_thread_lock_reentry_is_rejected_immediately_without_file_mutation(
+    tmp_path: Path,
+    operation: str,
+    use_peer: bool,
+) -> None:
+    path = tmp_path / "config.yaml"
+    store = ConfigStore(path)
+    store.save(AppConfig(allowed_media_roots=["original-setting"]))
+    original = path.read_bytes()
+    target = ConfigStore(path) if use_peer else store
+    elapsed = 10.0
+
+    def reenter(_: AppConfig) -> None:
+        nonlocal elapsed
+        started = time.monotonic()
+        try:
+            if operation == "load":
+                target.load()
+            elif operation == "save":
+                target.save(AppConfig(allowed_media_roots=["private-overwrite"]))
+            else:
+                target.update(
+                    lambda config: config.allowed_media_roots.append(
+                        "private-overwrite"
+                    )
+                )
+        finally:
+            elapsed = time.monotonic() - started
+
+    with pytest.raises(SensoryError) as caught:
+        store.update(reenter)
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert str(caught.value) == "A nested configuration transaction is not allowed."
+    assert elapsed < 0.5
+    assert path.read_bytes() == original
+    assert ConfigStore(path).load().allowed_media_roots == ["original-setting"]
+
+
+def test_cross_thread_updates_remain_serialized(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    first = ConfigStore(path)
+    second = ConfigStore(path)
+    first.save(AppConfig())
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def mutate(config: AppConfig) -> None:
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        config.allowed_media_roots.append(threading.current_thread().name)
+        with state_lock:
+            active -= 1
+
+    threads = [
+        threading.Thread(target=first.update, args=(mutate,), name="first"),
+        threading.Thread(target=second.update, args=(mutate,), name="second"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert maximum_active == 1
+    assert sorted(first.load().allowed_media_roots) == ["first", "second"]
+
+
 def test_update_mutator_conflict_aborts_without_overwriting_latest_config(
     tmp_path: Path,
 ) -> None:
@@ -193,6 +275,131 @@ def test_lock_and_io_failures_are_sanitized_without_private_paths(
     assert caught.value.code is ErrorCode.CONFIG_INVALID
     assert str(caught.value) == "The configuration file could not be updated safely."
     assert str(tmp_path) not in str(caught.value)
+    assert list(tmp_path.glob(".private-config.yaml.*.tmp")) == []
+
+
+def test_validation_failure_creates_no_temporary_yaml(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.yaml"
+    store = ConfigStore(path)
+    store.save(AppConfig())
+
+    def invalidate(config: AppConfig) -> None:
+        config.version = 2  # type: ignore[assignment]
+        config.allowed_media_roots.append("private-setting")
+
+    with pytest.raises(SensoryError) as caught:
+        store.update(invalidate)
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert list(tmp_path.glob(".config.yaml.*.tmp")) == []
+    assert "private-setting" not in path.read_text(encoding="utf-8")
+
+
+def test_temp_write_failure_is_sanitized_and_cleans_unique_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config.yaml"
+    store = ConfigStore(path)
+    real_named_temporary_file = tempfile.NamedTemporaryFile
+
+    class FailingTemporaryFile:
+        def __init__(self, **kwargs: object) -> None:
+            self._wrapped = real_named_temporary_file(**kwargs)
+            self.name = self._wrapped.name
+
+        def __enter__(self) -> Self:
+            self._wrapped.__enter__()
+            return self
+
+        def write(self, payload: str) -> None:
+            del payload
+            raise OSError("private-write-marker")
+
+        def __exit__(self, *args: object) -> object:
+            return self._wrapped.__exit__(*args)
+
+    monkeypatch.setattr(
+        "cove_sensory_mcp.config.store.tempfile.NamedTemporaryFile",
+        FailingTemporaryFile,
+    )
+
+    with pytest.raises(SensoryError) as caught:
+        store.save(AppConfig(allowed_media_roots=["private-yaml-marker"]))
+
+    assert str(caught.value) == "The configuration file could not be updated safely."
+    assert list(tmp_path.glob(".config.yaml.*.tmp")) == []
+    assert not path.exists()
+
+
+def test_temp_cleanup_failure_does_not_mask_primary_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config.yaml"
+    store = ConfigStore(path)
+
+    def fail_replace(source: Path, destination: Path) -> Path:
+        del source, destination
+        raise OSError("primary-private-marker")
+
+    def fail_cleanup(source: Path, *, missing_ok: bool = False) -> None:
+        del source, missing_ok
+        raise OSError("cleanup-private-marker")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+
+    with pytest.raises(SensoryError) as caught:
+        store.save(AppConfig(allowed_media_roots=["private-yaml-marker"]))
+
+    assert str(caught.value) == "The configuration file could not be updated safely."
+    assert isinstance(caught.value.__cause__, OSError)
+    assert str(caught.value.__cause__) == "primary-private-marker"
+    public = str(caught.value)
+    assert "private" not in public
+    leftovers = list(tmp_path.glob(".config.yaml.*.tmp"))
+    assert len(leftovers) == 1
+    assert leftovers[0].read_bytes() == b""
+
+
+def test_concurrent_stores_use_distinct_temporary_files_without_collisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config.yaml"
+    first = ConfigStore(path)
+    second = ConfigStore(path)
+    sources: list[Path] = []
+    real_replace = Path.replace
+
+    def record_replace(source: Path, destination: Path) -> Path:
+        sources.append(source)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", record_replace)
+    threads = [
+        threading.Thread(
+            target=first.save,
+            args=(AppConfig(allowed_media_roots=["first"]),),
+        ),
+        threading.Thread(
+            target=second.save,
+            args=(AppConfig(allowed_media_roots=["second"]),),
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(sources) == 2
+    assert len({source.name for source in sources}) == 2
+    assert all(source.parent == tmp_path for source in sources)
+    assert list(tmp_path.glob(".config.yaml.*.tmp")) == []
 
 
 def test_lock_timeout_is_sanitized_without_lock_path(

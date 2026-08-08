@@ -202,6 +202,69 @@ async def test_declared_image_and_video_are_verified_in_separate_provider_calls(
 
 
 @pytest.mark.asyncio
+async def test_provider_receives_canonical_trusted_asset_not_cwd_same_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    canonical = trusted / "fixture.png"
+    canonical.write_bytes(b"trusted")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "fixture.png").write_bytes(b"untrusted")
+    monkeypatch.chdir(cwd)
+    store = _configured_store(tmp_path)
+    provider = SemanticProvider({Modality.IMAGE: "A blue triangle is visible."})
+    relative_assets = SelfTestAssetStore(
+        {
+            Modality.IMAGE: PreparedMedia(
+                Path("fixture.png"),
+                "IMAGE/PNG",
+                MediaKind.IMAGE,
+                None,
+            )
+        },
+        trusted_root=trusted,
+    )
+
+    result = await _verifier(store, provider, relative_assets).verify(
+        "vision", [Modality.IMAGE]
+    )
+
+    assert result[0].verified is True
+    requested_media = provider.requests[0].media
+    assert requested_media.path == canonical.resolve(strict=True)
+    assert requested_media.path.read_bytes() == b"trusted"
+    assert requested_media.mime_type == "image/png"
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "No blue triangle appears in the image.",
+        "A blue triangle does not appear in the image.",
+        "A blue triangle is not visible.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_image_facts_require_an_affirmative_presence_event(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    summary: str,
+) -> None:
+    store = _configured_store(tmp_path)
+
+    result = await _verifier(
+        store,
+        SemanticProvider({Modality.IMAGE: summary}),
+        assets,
+    ).verify("vision", [Modality.IMAGE])
+
+    assert result[0].verified is False
+
+
+@pytest.mark.asyncio
 async def test_minimax_native_video_requires_asset_specific_motion_facts(
     tmp_path: Path,
     assets: SelfTestAssetStore,
@@ -276,6 +339,11 @@ async def test_video_position_without_motion_does_not_verify_native_video(
         "The red ball is not moving right.",
         "The red ball never moves right.",
         "The red ball remains still on the right.",
+        "The red ball appears not to move right.",
+        "The red ball cannot move right.",
+        "The red ball can't move right.",
+        "The red ball fails to move right.",
+        "The red ball is shown without moving right.",
     ],
 )
 @pytest.mark.asyncio
@@ -302,6 +370,23 @@ async def test_explicit_positive_motion_with_direction_verifies_video(
     store = _configured_store(tmp_path, adapter="minimax-m3")
     provider = SemanticProvider(
         {Modality.VIDEO_VISUAL: "The red ball moves to the right."}
+    )
+
+    result = await _verifier(store, provider, assets).verify(
+        "vision", [Modality.VIDEO_VISUAL]
+    )
+
+    assert result[0].verified is True
+
+
+@pytest.mark.asyncio
+async def test_negated_stationary_clause_does_not_negate_later_positive_motion(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+) -> None:
+    store = _configured_store(tmp_path, adapter="minimax-m3")
+    provider = SemanticProvider(
+        {Modality.VIDEO_VISUAL: "The red ball is not stationary; it moves right."}
     )
 
     result = await _verifier(store, provider, assets).verify(
@@ -344,6 +429,75 @@ async def test_video_audio_and_music_require_direct_semantic_facts(
 
     assert passed[0].verified is True
     assert failed[0].verified is False
+
+
+@pytest.mark.parametrize(
+    ("modality", "positive", "negated"),
+    [
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chimes twice.",
+            "A bell doesn't chime twice.",
+        ),
+        (
+            Modality.AUDIO,
+            "A tone beeps three times.",
+            "A tone does not beep three times.",
+        ),
+        (
+            Modality.MUSIC,
+            "A piano plays an ascending scale.",
+            "No piano plays an ascending scale.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_hearing_modalities_require_local_affirmative_events(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    positive: str,
+    negated: str,
+) -> None:
+    store = _configured_store(tmp_path)
+    positive_result = await _verifier(
+        store,
+        SemanticProvider({modality: positive}),
+        assets,
+    ).verify("vision", [modality])
+    negated_result = await _verifier(
+        store,
+        SemanticProvider({modality: negated}),
+        assets,
+    ).verify("vision", [modality])
+
+    assert positive_result[0].verified is True
+    assert negated_result[0].verified is False
+
+
+@pytest.mark.parametrize(
+    ("modality", "noun_only"),
+    [
+        (Modality.AUDIO, "Three beep tones."),
+        (Modality.MUSIC, "An ascending piano scale."),
+    ],
+)
+@pytest.mark.asyncio
+async def test_audio_and_music_nouns_without_event_verbs_do_not_verify(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    noun_only: str,
+) -> None:
+    store = _configured_store(tmp_path)
+
+    result = await _verifier(
+        store,
+        SemanticProvider({modality: noun_only}),
+        assets,
+    ).verify("vision", [modality])
+
+    assert result[0].verified is False
 
 
 @pytest.mark.asyncio

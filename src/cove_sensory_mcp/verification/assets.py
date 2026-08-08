@@ -32,7 +32,8 @@ class SelfTestAssetStore:
         trusted_root: Path,
     ) -> None:
         self._assets = dict(assets)
-        self._trusted_root = trusted_root.resolve(strict=False)
+        self._lexical_root = Path(os.path.abspath(trusted_root))
+        self._trusted_root = self._lexical_root.resolve(strict=False)
 
     @classmethod
     def packaged(cls) -> SelfTestAssetStore:
@@ -92,27 +93,40 @@ class SelfTestAssetStore:
                 or type(media.media_kind) is not MediaKind
                 or media.media_kind is not expected_kind
                 or type(media.mime_type) is not str
-                or not media.mime_type.lower().startswith(mime_prefix)
-                or len(media.mime_type) <= len(mime_prefix)
             ):
+                raise ValueError
+            normalized_mime = media.mime_type.strip().lower()
+            if not normalized_mime.startswith(mime_prefix) or len(
+                normalized_mime
+            ) <= len(mime_prefix):
                 raise ValueError
             candidate = Path(media.path)
             if not candidate.is_absolute():
-                candidate = self._trusted_root / candidate
+                candidate = self._lexical_root / candidate
             candidate = Path(os.path.abspath(candidate))
-            relative = candidate.relative_to(self._trusted_root)
-            current = self._trusted_root
+            try:
+                relative = candidate.relative_to(self._lexical_root)
+                traversal_root = self._lexical_root
+            except ValueError:
+                relative = candidate.relative_to(self._trusted_root)
+                traversal_root = self._trusted_root
+            current = traversal_root
             for part in relative.parts:
                 current = current / part
                 if current.is_symlink():
                     raise ValueError
             resolved = candidate.resolve(strict=True)
             resolved.relative_to(self._trusted_root)
-            if resolved != candidate or not stat.S_ISREG(candidate.lstat().st_mode):
+            if not stat.S_ISREG(resolved.lstat().st_mode):
                 raise ValueError
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             raise SensoryError(
                 ErrorCode.SOURCE_NOT_FOUND,
                 _MISSING_ASSET_MESSAGE,
             ) from None
-        return media
+        return PreparedMedia(
+            path=resolved,
+            mime_type=normalized_mime,
+            media_kind=expected_kind,
+            duration_seconds=media.duration_seconds,
+        )

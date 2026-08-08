@@ -153,3 +153,62 @@ def test_asset_store_accepts_exact_kind_and_mime_inside_trusted_root(
     )
 
     assert store.get(Modality.MUSIC) == media
+
+
+def test_relative_asset_is_returned_as_canonical_root_path_with_normalized_mime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    canonical = trusted / "fixture.png"
+    canonical.write_bytes(b"trusted-image")
+    untrusted_cwd = tmp_path / "cwd"
+    untrusted_cwd.mkdir()
+    (untrusted_cwd / "fixture.png").write_bytes(b"wrong-image")
+    monkeypatch.chdir(untrusted_cwd)
+    original = _media(
+        Path("fixture.png"),
+        "IMAGE/PNG",
+        MediaKind.IMAGE,
+    )
+    store = SelfTestAssetStore(
+        {Modality.IMAGE: original},
+        trusted_root=trusted,
+    )
+
+    normalized = store.get(Modality.IMAGE)
+
+    assert normalized is not original
+    assert normalized.path == canonical.resolve(strict=True)
+    assert normalized.path.is_absolute()
+    assert normalized.path.read_bytes() == b"trusted-image"
+    assert normalized.mime_type == "image/png"
+
+
+def test_trusted_root_alias_uses_resolved_containment_and_canonical_result(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+    asset = real_root / "fixture.png"
+    asset.write_bytes(b"fixture")
+    alias_root = tmp_path / "root-alias"
+    try:
+        alias_root.symlink_to(real_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform does not permit test symlink creation")
+    store = SelfTestAssetStore(
+        {
+            Modality.IMAGE: _media(
+                alias_root / "fixture.png",
+                "image/png",
+                MediaKind.IMAGE,
+            )
+        },
+        trusted_root=alias_root,
+    )
+
+    normalized = store.get(Modality.IMAGE)
+
+    assert normalized.path == asset.resolve(strict=True)

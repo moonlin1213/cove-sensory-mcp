@@ -5,6 +5,7 @@ datas = (
     collect_data_files("cove_sensory_mcp", includes=["assets/self_test/*"])
     + copy_metadata("mcp")
     + copy_metadata("keyring")
+    + [("LICENSE", "."), ("NOTICE", "."), ("THIRD_PARTY_NOTICES.md", ".")]
 )
 hiddenimports = collect_submodules("keyring.backends")
 

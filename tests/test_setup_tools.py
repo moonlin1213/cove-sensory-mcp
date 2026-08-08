@@ -7,15 +7,25 @@ from dataclasses import fields
 
 import pytest
 
+from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig
 from cove_sensory_mcp.config.secrets import MemorySecretStore
 from cove_sensory_mcp.config.store import ConfigStore
-from cove_sensory_mcp.models import Modality
+from cove_sensory_mcp.models import Modality, RouteConfig
+from cove_sensory_mcp.providers.base import (
+    MediaKind,
+    PreparedMedia,
+    ProviderCallResult,
+    ProviderRequest,
+)
+from cove_sensory_mcp.providers.registry import ProviderRegistry
+from cove_sensory_mcp.reports.schemas import ObservationEnvelope
 from cove_sensory_mcp.services import AppServices
 from cove_sensory_mcp.tools.setup import (
     sensory_self_test,
     sensory_setup_guide,
     sensory_status,
 )
+from cove_sensory_mcp.verification.assets import SelfTestAssetStore
 
 
 @pytest.fixture
@@ -81,8 +91,11 @@ async def test_foundation_self_test_requires_setup_without_network(
     services: AppServices, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Replacing the foundation verifier with a provider call must remain visible."""
+
     def fail_network(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the foundation self-test must not open a network connection")
+        raise AssertionError(
+            "the foundation self-test must not open a network connection"
+        )
 
     monkeypatch.setattr(socket, "create_connection", fail_network)
 
@@ -100,7 +113,9 @@ async def test_foundation_self_test_requires_setup_without_network(
 
 
 @pytest.mark.asyncio
-async def test_setup_guide_returns_fresh_json_data_for_each_request(services: AppServices) -> None:
+async def test_setup_guide_returns_fresh_json_data_for_each_request(
+    services: AppServices,
+) -> None:
     """Sharing mutable guide data would let one caller alter another caller's response."""
     first = await sensory_setup_guide(services)
     first["provider_options"][0]["default_capabilities"].append("incorrect mutation")
@@ -131,7 +146,9 @@ async def test_self_test_returns_the_injected_verifiers_public_result(
     """Bypassing a future verifier would make provider self-tests impossible to add."""
     verifier = StubVerifier()
 
-    result = await sensory_self_test(services, [Modality.VIDEO_VISUAL], verifier=verifier)
+    result = await sensory_self_test(
+        services, [Modality.VIDEO_VISUAL], verifier=verifier
+    )
 
     assert result == {"status": "ok", "verified": ["video_visual"]}
     assert verifier.modalities == [Modality.VIDEO_VISUAL]
@@ -176,7 +193,9 @@ async def test_self_test_replaces_non_json_verifier_output_with_a_public_error(
     services: AppServices,
 ) -> None:
     """Serializing arbitrary verifier objects could reveal implementation details."""
-    result = await sensory_self_test(services, [Modality.IMAGE], verifier=InvalidResultVerifier())
+    result = await sensory_self_test(
+        services, [Modality.IMAGE], verifier=InvalidResultVerifier()
+    )
 
     assert result == {
         "status": "error",
@@ -185,4 +204,120 @@ async def test_self_test_replaces_non_json_verifier_output_with_a_public_error(
             "message": "The self-test result is invalid.",
             "retryable": False,
         },
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_advertises_only_routes_whose_provider_modality_is_verified(
+    services: AppServices,
+) -> None:
+    """A stale or merely declared route must never advertise working perception."""
+    services.config_store.save(
+        AppConfig(
+            providers={
+                "vision": ProviderConfig(
+                    adapter="gemini",
+                    model="test-model",
+                    credential_ref="test-ref",
+                    declared_capabilities={
+                        Modality.IMAGE: True,
+                        Modality.VIDEO_VISUAL: True,
+                    },
+                    verified_capabilities={Modality.IMAGE: True},
+                )
+            },
+            routes={
+                "image": RouteConfig(primary="vision"),
+                "video_visual": RouteConfig(primary="vision"),
+            },
+        )
+    )
+
+    result = await sensory_status(services)
+
+    assert result["ready"] is True
+    assert result["capabilities"]["image"] == {
+        "modality": "image",
+        "enabled": True,
+        "verified": True,
+        "provider": "vision",
+        "mode": None,
+        "reason": None,
+    }
+    assert result["capabilities"]["video_visual"]["enabled"] is False
+    assert result["capabilities"]["video_visual"]["verified"] is False
+    assert result["capabilities"]["video_visual"]["provider"] is None
+
+
+class PublicSemanticProvider:
+    """Return asset-specific image facts through the real verifier boundary."""
+
+    async def sense(self, request: ProviderRequest) -> ProviderCallResult:
+        modality = next(iter(request.requested_modalities))
+        observation = ObservationEnvelope(
+            modality=modality,
+            summary="A blue triangle appears on a white field.",
+            segments=[],
+            transcript=[],
+            warnings=[],
+            confidence="high",
+        )
+        return ProviderCallResult(
+            observations={modality: observation},
+            provider_id="vision",
+            model="test-model",
+            remote_file_deleted=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_self_test_invokes_capability_verifier_and_returns_stable_public_results(
+    services: AppServices,
+    tmp_path,
+) -> None:
+    """Leaving the foundation placeholder wired would never verify configured providers."""
+    image = tmp_path / "self-test-image.png"
+    image.write_bytes(b"tiny-image")
+    services.config_store.save(
+        AppConfig(
+            providers={
+                "vision": ProviderConfig(
+                    adapter="gemini",
+                    model="test-model",
+                    credential_ref="test-ref",
+                    declared_capabilities={Modality.IMAGE: True},
+                )
+            }
+        )
+    )
+
+    result = await sensory_self_test(
+        services,
+        [Modality.IMAGE],
+        registry=ProviderRegistry({"vision": PublicSemanticProvider()}),
+        assets=SelfTestAssetStore(
+            {
+                Modality.IMAGE: PreparedMedia(
+                    image,
+                    "image/png",
+                    MediaKind.IMAGE,
+                    None,
+                )
+            }
+        ),
+    )
+
+    assert result == {
+        "status": "ok",
+        "results": [
+            {
+                "provider": "vision",
+                "modality": "image",
+                "verified": True,
+                "reason": None,
+            }
+        ],
+    }
+    assert services.config_store.load().providers["vision"].verified_capabilities == {
+        Modality.IMAGE: True
     }

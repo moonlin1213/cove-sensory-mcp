@@ -37,7 +37,9 @@ async def test_foundation_server_lists_exact_setup_tools(services: AppServices) 
 
 
 @pytest.mark.asyncio
-async def test_setup_tools_advertise_local_read_only_safety(services: AppServices) -> None:
+async def test_setup_tools_advertise_local_read_only_safety(
+    services: AppServices,
+) -> None:
     """Unsafe descriptions or mutation hints could invite credential-bearing calls."""
     tools = await create_server(services).list_tools()
 
@@ -48,9 +50,16 @@ async def test_setup_tools_advertise_local_read_only_safety(services: AppService
         assert tool.annotations.read_only_hint is True
         assert tool.annotations.destructive_hint is False
 
+    self_test = next(tool for tool in tools if tool.name == "sensory_self_test")
+    description = self_test.description.lower()
+    assert "tiny test media" in description
+    assert "provider quota" in description
+
 
 @pytest.mark.asyncio
-async def test_setup_tools_expose_only_explicit_public_inputs(services: AppServices) -> None:
+async def test_setup_tools_expose_only_explicit_public_inputs(
+    services: AppServices,
+) -> None:
     """Leaking service or verifier parameters would expose internal composition over MCP."""
     tools = {tool.name: tool for tool in await create_server(services).list_tools()}
 

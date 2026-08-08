@@ -8,12 +8,307 @@ import keyring
 import pytest
 
 from cove_sensory_mcp import __version__, cli
-from cove_sensory_mcp.cli import main, run_configure, run_doctor, run_status
+from cove_sensory_mcp.cli import (
+    main,
+    run_configure,
+    run_doctor,
+    run_self_test,
+    run_status,
+)
 from cove_sensory_mcp.config.paths import AppPaths
 from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig
 from cove_sensory_mcp.config.secrets import MemorySecretStore
 from cove_sensory_mcp.config.store import ConfigStore
+from cove_sensory_mcp.models import Modality
 from cove_sensory_mcp.services import AppServices
+
+
+def test_self_test_refusal_makes_no_provider_call_or_config_write(
+    tmp_services: AppServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quota-bearing self-test requires confirmation before any Provider work."""
+    messages: list[str] = []
+    called = False
+
+    async def unexpected_self_test(
+        *args: object, **kwargs: object
+    ) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {"status": "ok", "results": []}
+
+    def refuse_after_notice(prompt: str) -> str:
+        notice = " ".join(messages).lower()
+        assert "tiny test media" in notice
+        assert "provider quota" in notice
+        assert "continue" in prompt.lower()
+        return "no"
+
+    monkeypatch.setattr(cli, "sensory_self_test", unexpected_self_test)
+
+    assert (
+        run_self_test(
+            tmp_services,
+            output=messages.append,
+            input_fn=refuse_after_notice,
+            yes=False,
+        )
+        == 1
+    )
+    assert called is False
+    assert not tmp_services.config_store.path.exists()
+
+
+def test_self_test_yes_is_explicit_noninteractive_confirmation(
+    tmp_services: AppServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The --yes path must print the quota notice but never block for stdin."""
+    messages: list[str] = []
+    calls = 0
+
+    async def successful_self_test(
+        *args: object, **kwargs: object
+    ) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"status": "ok", "results": []}
+
+    monkeypatch.setattr(cli, "sensory_self_test", successful_self_test)
+
+    assert (
+        run_self_test(
+            tmp_services,
+            output=messages.append,
+            input_fn=lambda _: pytest.fail("--yes prompted for confirmation"),
+            yes=True,
+        )
+        == 0
+    )
+    assert calls == 1
+    report = " ".join(messages).lower()
+    assert "tiny test media" in report
+    assert "provider quota" in report
+
+
+def test_main_self_test_yes_reaches_noninteractive_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing to register --yes would make supported automation impossible."""
+    captured: dict[str, object] = {}
+
+    def capture_runner(
+        services: AppServices,
+        output,
+        input_fn,
+        *,
+        yes: bool,
+    ) -> int:
+        captured.update(services=services, output=output, input_fn=input_fn, yes=yes)
+        return 0
+
+    monkeypatch.setattr(cli, "_build_services", lambda: object())
+    monkeypatch.setattr(cli, "run_self_test", capture_runner)
+
+    assert main(["self-test", "--yes"]) == 0
+    assert captured["yes"] is True
+
+
+def test_configure_eye_and_ear_steps_write_only_capabilities_verified_in_batch(
+    tmp_services: AppServices,
+) -> None:
+    """Role selection must not turn a merely declared Provider into a working route."""
+    answers = iter(
+        [
+            "gemini",
+            "gemini-main",
+            "gemini-test-model",
+            "yes",  # eye
+            "yes",  # ear
+            "yes",  # tiny-media verification
+        ]
+    )
+    messages: list[str] = []
+
+    async def verify_selected(
+        services: AppServices,
+        provider_id: str,
+        modalities: list[Modality],
+    ) -> dict[str, object]:
+        assert provider_id == "gemini"
+        assert modalities == list(Modality)
+        config = services.config_store.load()
+        provider = config.providers[provider_id]
+        provider.verified_capabilities = {
+            Modality.IMAGE: True,
+            Modality.AUDIO: True,
+        }
+        services.config_store.save(config)
+        return {"status": "partial", "results": []}
+
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "local-gemini-secret",
+            output=messages.append,
+            verify_fn=verify_selected,
+        )
+        == 0
+    )
+
+    config = tmp_services.config_store.load()
+    assert config.routes.image is not None
+    assert config.routes.image.primary == "gemini"
+    assert config.routes.audio is not None
+    assert config.routes.audio.primary == "gemini"
+    assert config.routes.video_visual is None
+    assert config.routes.video_audio is None
+    assert config.routes.music is None
+    notice = " ".join(messages).lower()
+    assert "gemini" in notice and "eye" in notice and "ear" in notice
+    assert "minimax-m3" in notice and "native-video eye" in notice
+    assert "not" in notice and "ear" in notice
+
+
+@pytest.mark.parametrize(
+    ("authorization", "expected_fallbacks"), [("no", []), ("yes", ["ear-two"])]
+)
+def test_configure_cross_provider_fallback_requires_explicit_authorization(
+    tmp_services: AppServices,
+    authorization: str,
+    expected_fallbacks: list[str],
+) -> None:
+    """A second capable Provider must never become a fallback through inference."""
+    existing = ProviderConfig(
+        adapter="gemini",
+        model="ear-model",
+        credential_ref="ear-two-ref",
+        declared_capabilities={Modality.AUDIO: True},
+        verified_capabilities={Modality.AUDIO: True},
+    )
+    tmp_services.config_store.save(AppConfig(providers={"ear-two": existing}))
+    assert isinstance(tmp_services.secret_store, MemorySecretStore)
+    tmp_services.secret_store.set("ear-two-ref", "existing-ear-secret")
+    answers = iter(
+        [
+            "gemini",
+            "gemini-main",
+            "gemini-test-model",
+            "no",  # eye
+            "yes",  # ear
+            "yes",  # verification
+            authorization,  # ear-two fallback for audio
+        ]
+    )
+
+    async def verify_audio_only(
+        services: AppServices,
+        provider_id: str,
+        modalities: list[Modality],
+    ) -> dict[str, object]:
+        assert modalities == [Modality.VIDEO_AUDIO, Modality.AUDIO, Modality.MUSIC]
+        config = services.config_store.load()
+        config.providers[provider_id].verified_capabilities = {Modality.AUDIO: True}
+        services.config_store.save(config)
+        return {"status": "partial", "results": []}
+
+    prompts: list[str] = []
+
+    def answer(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=answer,
+            secret_input_fn=lambda _: "new-gemini-secret",
+            output=lambda _: None,
+            verify_fn=verify_audio_only,
+        )
+        == 0
+    )
+
+    route = tmp_services.config_store.load().routes.audio
+    assert route is not None
+    assert [fallback.provider for fallback in route.fallbacks] == expected_fallbacks
+    assert all(fallback.authorized is True for fallback in route.fallbacks)
+    fallback_prompts = [prompt for prompt in prompts if "fallback" in prompt.lower()]
+    assert len(fallback_prompts) == 1
+    assert "audio" in fallback_prompts[0].lower()
+
+
+def test_configure_declined_verification_saves_provider_but_no_routes(
+    tmp_services: AppServices,
+) -> None:
+    """Users may save local configuration and defer every quota-bearing self-test."""
+    answers = iter(
+        [
+            "minimax-m3",
+            "minimax-main",
+            "global",
+            "MiniMax-M3",
+            "yes",  # eye
+            "no",  # verification
+        ]
+    )
+    called = False
+
+    async def unexpected_verify(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {"status": "ok"}
+
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "minimax-secret",
+            output=lambda _: None,
+            verify_fn=unexpected_verify,
+        )
+        == 0
+    )
+    config = tmp_services.config_store.load()
+    assert set(config.providers) == {"minimax-m3"}
+    assert config.routes.image is None
+    assert config.routes.video_visual is None
+    assert called is False
+
+
+def test_cli_status_lists_only_verified_routed_modalities_without_foundation_claim(
+    tmp_services: AppServices,
+) -> None:
+    """The CLI must not hide a working route or advertise a stale unverified one."""
+    provider = ProviderConfig(
+        adapter="gemini",
+        model="test-model",
+        credential_ref="test-ref",
+        declared_capabilities={
+            Modality.IMAGE: True,
+            Modality.VIDEO_VISUAL: True,
+        },
+        verified_capabilities={Modality.IMAGE: True},
+    )
+    tmp_services.config_store.save(
+        AppConfig(
+            providers={"vision": provider},
+            routes={
+                "image": {"primary": "vision"},
+                "video_visual": {"primary": "vision"},
+            },
+        )
+    )
+    messages: list[str] = []
+
+    assert run_status(tmp_services, output=messages.append) == 0
+
+    report = "\n".join(messages).lower()
+    assert "verified image: vision" in report
+    assert "verified video_visual" not in report
+    assert "foundation provider perception" not in report
 
 
 @pytest.fixture
@@ -37,6 +332,7 @@ def test_version_command_prints_only_version(capsys) -> None:
 
 def test_version_does_not_compose_runtime_services(monkeypatch, capsys) -> None:
     """Composing paths or keyring for --version would add machine side effects."""
+
     def fail_composition(*args: object, **kwargs: object) -> None:
         raise AssertionError("--version must not compose runtime services")
 
@@ -112,11 +408,11 @@ def test_configure_saves_reference_but_not_secret(
     )
 
 
-def test_configure_stops_prompting_after_one_provider_is_saved(
+def test_configure_stops_after_one_provider_and_its_separate_role_steps(
     tmp_services: AppServices,
 ) -> None:
-    """Restoring the discarded post-save question would imply an unsupported provider loop."""
-    answers = iter(["gemini", "gemini-main", "gemini-test-model"])
+    """Role selection must not restore an unbounded add-another-provider loop."""
+    answers = iter(["gemini", "gemini-main", "gemini-test-model", "no", "no"])
     prompts: list[str] = []
 
     def answer(prompt: str) -> str:
@@ -124,14 +420,19 @@ def test_configure_stops_prompting_after_one_provider_is_saved(
         try:
             return next(answers)
         except StopIteration:
-            pytest.fail("configure asked an extra question after saving one provider")
+            pytest.fail("configure asked an extra question after both role decisions")
 
-    assert run_configure(
-        tmp_services,
-        input_fn=answer,
-        secret_input_fn=lambda _: "test-secret-that-stays-local",
-        output=lambda _: None,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=answer,
+            secret_input_fn=lambda _: "test-secret-that-stays-local",
+            output=lambda _: None,
+        )
+        == 0
+    )
+    assert any("eye" in prompt.lower() for prompt in prompts)
+    assert any("ear" in prompt.lower() for prompt in prompts)
     assert all("another provider" not in prompt.lower() for prompt in prompts)
 
 
@@ -148,12 +449,15 @@ def test_configure_explains_capabilities_and_privacy_before_accepting_key(
         assert "local" in notice and "never" in notice and "chat" in notice
         return "test-secret-that-stays-local"
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=secret_after_notice,
-        output=messages.append,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=secret_after_notice,
+            output=messages.append,
+        )
+        == 0
+    )
 
 
 def test_configure_environment_reference_never_prompts_for_or_stores_key(
@@ -170,12 +474,15 @@ def test_configure_environment_reference_never_prompts_for_or_stores_key(
     def unexpected_secret_prompt(_: str) -> str:
         pytest.fail("environment mode must not prompt for a secret")
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=unexpected_secret_prompt,
-        output=messages.append,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=unexpected_secret_prompt,
+            output=messages.append,
+        )
+        == 0
+    )
 
     provider = tmp_services.config_store.load().providers["gemini"]
     assert provider.api_key_env == environment_name
@@ -209,13 +516,20 @@ def test_configure_environment_only_succeeds_when_keyring_is_unavailable(
     )
     answers = iter(["gemini", f"env:{environment_name}", "gemini-test-model", "n"])
 
-    assert run_configure(
-        services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: pytest.fail("environment mode prompted for a key"),
-        output=lambda _: None,
-    ) == 0
-    assert services.config_store.load().providers["gemini"].api_key_env == environment_name
+    assert (
+        run_configure(
+            services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: pytest.fail(
+                "environment mode prompted for a key"
+            ),
+            output=lambda _: None,
+        )
+        == 0
+    )
+    assert (
+        services.config_store.load().providers["gemini"].api_key_env == environment_name
+    )
 
 
 def test_configure_missing_environment_reference_saves_and_reports_only_absence(
@@ -228,12 +542,17 @@ def test_configure_missing_environment_reference_saves_and_reports_only_absence(
     answers = iter(["gemini", f"env:{environment_name}", "gemini-test-model", "n"])
     messages: list[str] = []
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: pytest.fail("environment mode prompted for a key"),
-        output=messages.append,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: pytest.fail(
+                "environment mode prompted for a key"
+            ),
+            output=messages.append,
+        )
+        == 0
+    )
 
     report = "\n".join(messages)
     assert "missing" in report.lower()
@@ -250,12 +569,17 @@ def test_configure_rejects_invalid_environment_reference_without_persistence(
     """Accepting a nonportable env: form would defer failure until another platform runs it."""
     answers = iter(["gemini", f"env:{environment_name}", "gemini-test-model", "n"])
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: pytest.fail("invalid environment mode prompted for a key"),
-        output=lambda _: None,
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: pytest.fail(
+                "invalid environment mode prompted for a key"
+            ),
+            output=lambda _: None,
+        )
+        == 1
+    )
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
@@ -274,12 +598,15 @@ def test_configure_minimax_region_selects_non_secret_base_url(
     """Mapping a region to the wrong host would send later media to the wrong endpoint."""
     answers = iter(["minimax-m3", "minimax-main", region, "MiniMax-M3", "n"])
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "minimax-test-secret",
-        output=lambda _: None,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "minimax-test-secret",
+            output=lambda _: None,
+        )
+        == 0
+    )
 
     provider = tmp_services.config_store.load().providers["minimax-m3"]
     assert provider.adapter == "minimax-m3"
@@ -301,12 +628,15 @@ def test_configure_minimax_custom_endpoint_rejects_secret_bearing_url(
         ]
     )
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "minimax-test-secret",
-        output=lambda _: None,
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "minimax-test-secret",
+            output=lambda _: None,
+        )
+        == 1
+    )
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
@@ -327,12 +657,15 @@ def test_configure_minimax_custom_endpoint_with_numeric_port_is_saved(
         ]
     )
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "minimax-test-secret",
-        output=lambda _: None,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "minimax-test-secret",
+            output=lambda _: None,
+        )
+        == 0
+    )
     assert (
         tmp_services.config_store.load().providers["minimax-m3"].base_url
         == "https://api.example.test:8443/v1"
@@ -354,12 +687,15 @@ def test_configure_minimax_custom_endpoint_rejects_malformed_port_before_persist
         ["minimax-m3", "minimax-main", "custom", base_url, "MiniMax-M3", "n"]
     )
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "minimax-test-secret",
-        output=lambda _: None,
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "minimax-test-secret",
+            output=lambda _: None,
+        )
+        == 1
+    )
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
@@ -381,12 +717,15 @@ def test_configure_custom_provider_saves_only_declared_supported_capabilities(
         ]
     )
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "custom-provider-secret",
-        output=lambda _: None,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "custom-provider-secret",
+            output=lambda _: None,
+        )
+        == 0
+    )
 
     provider = tmp_services.config_store.load().providers["studio-sense"]
     assert provider.adapter == "openai-compatible"
@@ -418,12 +757,15 @@ def test_configure_rejects_unknown_custom_capability_without_saving(
         ]
     )
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "custom-provider-secret",
-        output=lambda _: None,
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "custom-provider-secret",
+            output=lambda _: None,
+        )
+        == 1
+    )
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
@@ -492,12 +834,15 @@ def test_configure_cancel_at_any_plaintext_prompt_does_not_persist(
         return "must-not-be-stored"
 
     messages: list[str] = []
-    assert run_configure(
-        tmp_services,
-        input_fn=supplied_answer,
-        secret_input_fn=unexpected_secret_prompt,
-        output=messages.append,
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=supplied_answer,
+            secret_input_fn=unexpected_secret_prompt,
+            output=messages.append,
+        )
+        == 1
+    )
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
@@ -515,12 +860,15 @@ def test_configure_hidden_secret_prompt_cancels_only_on_terminal_interruption(
     def interrupted_secret(_: str) -> str:
         raise cancel_exception
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=interrupted_secret,
-        output=lambda _: None,
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=interrupted_secret,
+            output=lambda _: None,
+        )
+        == 1
+    )
     assert not tmp_services.config_store.path.exists()
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
@@ -532,12 +880,15 @@ def test_configure_does_not_parse_hidden_secret_text_as_a_cancel_command(
     """Secret input must remain opaque even when its text contains a cancellation word."""
     answers = iter(["gemini", "gemini-main", "gemini-test-model", "n"])
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "cancel-is-part-of-this-secret",
-        output=lambda _: None,
-    ) == 0
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "cancel-is-part-of-this-secret",
+            output=lambda _: None,
+        )
+        == 0
+    )
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {
         "gemini-main": "cancel-is-part-of-this-secret"
@@ -545,7 +896,9 @@ def test_configure_does_not_parse_hidden_secret_text_as_a_cancel_command(
 
 
 def test_configure_refuses_occupied_secret_reference_without_overwrite_or_delete(
-    tmp_services: AppServices, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_services: AppServices,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A failed save after overwriting an occupied ref must not destroy its original value."""
     original_secret = "original-secret-must-survive"
@@ -567,12 +920,15 @@ def test_configure_refuses_occupied_secret_reference_without_overwrite_or_delete
 
     monkeypatch.setattr(tmp_services.config_store, "save", fail_save)
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=supplied_secret,
-        output=lambda message: print(message),
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=supplied_secret,
+            output=lambda message: print(message),
+        )
+        == 1
+    )
     assert secret_prompted is False
     assert tmp_services.secret_store.values == {reference: original_secret}
     assert not tmp_services.config_store.path.exists()
@@ -595,12 +951,15 @@ def test_configure_deletes_just_created_secret_when_config_save_fails(
 
     monkeypatch.setattr(tmp_services.config_store, "save", fail_save)
 
-    assert run_configure(
-        tmp_services,
-        input_fn=lambda _: next(answers),
-        secret_input_fn=lambda _: "rollback-test-secret",
-        output=lambda _: None,
-    ) == 1
+    assert (
+        run_configure(
+            tmp_services,
+            input_fn=lambda _: next(answers),
+            secret_input_fn=lambda _: "rollback-test-secret",
+            output=lambda _: None,
+        )
+        == 1
+    )
     assert isinstance(tmp_services.secret_store, MemorySecretStore)
     assert tmp_services.secret_store.values == {}
 
@@ -651,7 +1010,7 @@ def test_status_rejects_invalid_provider_identifier_without_echo(
     assert run_status(tmp_services, output=messages.append) == 1
 
     report = "\n".join(messages)
-    assert report == "Configuration: invalid\nFoundation provider perception: unavailable"
+    assert report == "Configuration: invalid\nVerified sensory routes: unavailable"
     assert private_identifier not in report
 
 
@@ -717,10 +1076,14 @@ def test_doctor_probes_and_cleans_the_injected_platform_jobs_root(
 
     def recording_temporary_directory(*args: object, **kwargs: object):
         directory = kwargs.get("dir")
-        probed_roots.append(Path(directory) if isinstance(directory, (str, Path)) else None)
+        probed_roots.append(
+            Path(directory) if isinstance(directory, (str, Path)) else None
+        )
         return real_temporary_directory(*args, **kwargs)
 
-    monkeypatch.setattr(cli.tempfile, "TemporaryDirectory", recording_temporary_directory)
+    monkeypatch.setattr(
+        cli.tempfile, "TemporaryDirectory", recording_temporary_directory
+    )
     services = cli._build_services()
     assert isinstance(services.secret_store, MemorySecretStore)
     services.secret_store.set("gemini-main", "doctor-test-secret")
@@ -754,7 +1117,9 @@ def test_doctor_bounds_jobs_probe_failure_to_the_configured_root(
         local=None,
     )
     paths.jobs_dir.parent.mkdir(parents=True)
-    paths.jobs_dir.write_text("leave this configured-root blocker intact", encoding="utf-8")
+    paths.jobs_dir.write_text(
+        "leave this configured-root blocker intact", encoding="utf-8"
+    )
     monkeypatch.setattr(cli.AppPaths, "for_system", lambda *args, **kwargs: paths)
     monkeypatch.setattr(cli, "KeyringSecretStore", MemorySecretStore)
     monkeypatch.setattr(cli.shutil, "which", lambda executable: "/test/bin/ffmpeg")
@@ -768,15 +1133,19 @@ def test_doctor_bounds_jobs_probe_failure_to_the_configured_root(
     )
 
 
-def test_foundation_self_test_subcommand_stays_local_and_reports_setup_required(
-    tmp_services: AppServices, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_confirmed_empty_self_test_reports_setup_required_without_provider_claim(
+    tmp_services: AppServices,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Foundation self-test must not imply that an unimplemented provider was contacted."""
+    """An explicitly confirmed empty self-test must still report truthful setup state."""
     monkeypatch.setattr(cli, "_build_services", lambda: tmp_services)
 
-    assert main(["self-test"]) == 1
+    assert main(["self-test", "--yes"]) == 1
 
     captured = capsys.readouterr()
     assert "SETUP_REQUIRED" in captured.out
+    assert "tiny test media" in captured.out.lower()
+    assert "provider quota" in captured.out.lower()
     assert "provider" in captured.out.lower()
     assert captured.err == ""

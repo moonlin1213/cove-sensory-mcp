@@ -29,22 +29,26 @@ _SAFE_ANNOTATIONS = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=False,
 )
-_STATUS_DESCRIPTION = (
-    "Inspect local configuration status; read-only setup tools never accept credentials."
-)
-_GUIDE_DESCRIPTION = (
-    "Inspect local configuration setup options; read-only setup tools never accept credentials."
-)
+_STATUS_DESCRIPTION = "Inspect local configuration status; read-only setup tools never accept credentials."
+_GUIDE_DESCRIPTION = "Inspect local configuration setup options; read-only setup tools never accept credentials."
 _SELF_TEST_DESCRIPTION = (
-    "Inspect local configuration readiness; read-only setup tools never accept credentials."
+    "Inspect local configuration readiness by sending tiny test media to the configured "
+    "Provider; this may use a small amount of Provider quota. Read-only setup tools never "
+    "accept credentials."
 )
 _INVALID_ARGUMENTS_MESSAGE = "The tool arguments are invalid."
 
 
 def _invalid_arguments_result() -> CallToolResult:
-    payload = error_result(SensoryError(ErrorCode.CONFIG_INVALID, _INVALID_ARGUMENTS_MESSAGE))
+    payload = error_result(
+        SensoryError(ErrorCode.CONFIG_INVALID, _INVALID_ARGUMENTS_MESSAGE)
+    )
     return CallToolResult(
-        content=[TextContent(text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))],
+        content=[
+            TextContent(
+                text=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            )
+        ],
         structured_content=payload,
         is_error=True,
     )
@@ -91,7 +95,9 @@ def create_server(services: AppServices) -> FastMCP[None]:
         annotations=_SAFE_ANNOTATIONS,
     )
     async def self_test_tool(modalities: list[RequestedModality]) -> dict[str, object]:
-        return await sensory_self_test(services, [Modality(modality) for modality in modalities])
+        return await sensory_self_test(
+            services, [Modality(modality) for modality in modalities]
+        )
 
     return server
 

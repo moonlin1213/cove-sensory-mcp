@@ -8,7 +8,7 @@ import os
 import platform
 import shutil
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from pydantic import TypeAdapter
@@ -19,13 +19,17 @@ from .config.schema import AppConfig, ProviderConfig
 from .config.secrets import KeyringSecretStore
 from .config.store import ConfigStore
 from .errors import SensoryError
-from .models import Modality, ProviderId
+from .models import Modality, ProviderId, ProviderRef, RouteConfig
 from .server import run_stdio
 from .services import AppServices
-from .tools.setup import sensory_self_test
+from .tools.setup import sensory_self_test, verify_provider_capabilities
 
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], None]
+ConfigureVerifyFn = Callable[
+    [AppServices, str, list[Modality]],
+    Awaitable[dict[str, object]],
+]
 
 _MINIMAX_BASE_URLS = {
     "cn": "https://api.minimaxi.com/v1",
@@ -93,6 +97,11 @@ def _declared_capabilities(value: str) -> dict[Modality, bool]:
     return {modality: modality.value in selected for modality in Modality}
 
 
+def _default_capabilities(*modalities: Modality) -> dict[Modality, bool]:
+    selected = frozenset(modalities)
+    return {modality: modality in selected for modality in Modality}
+
+
 def _provider_from_answers(
     provider_choice: str,
     input_fn: InputFn,
@@ -107,6 +116,7 @@ def _provider_from_answers(
             model=model,
             credential_ref=credential_ref,
             api_key_env=api_key_env,
+            declared_capabilities=_default_capabilities(*Modality),
         )
         return "gemini", provider
 
@@ -128,11 +138,17 @@ def _provider_from_answers(
             model=model,
             credential_ref=credential_ref,
             api_key_env=api_key_env,
+            declared_capabilities=_default_capabilities(
+                Modality.IMAGE,
+                Modality.VIDEO_VISUAL,
+            ),
         )
         return "minimax-m3", provider
 
     if provider_choice == "custom":
-        provider_id = _validated_identifier(_clean_answer(input_fn, "Provider identifier: "))
+        provider_id = _validated_identifier(
+            _clean_answer(input_fn, "Provider identifier: ")
+        )
         credential_ref, api_key_env = _credential_source(
             _clean_answer(input_fn, "Credential reference (or env:VARIABLE_NAME): ")
         )
@@ -158,17 +174,78 @@ def _provider_from_answers(
     raise ValueError("invalid provider")
 
 
+def _optional_yes(input_fn: InputFn, prompt: str) -> bool:
+    """Read one explicit authorization, defaulting safely when scripted input ends."""
+    try:
+        answer = _clean_answer(input_fn, prompt).lower()
+    except StopIteration:
+        return False
+    if answer in {"y", "yes"}:
+        return True
+    if answer in {"", "n", "no"}:
+        return False
+    raise ValueError("invalid yes/no answer")
+
+
+def _role_modalities(*, eye: bool, ear: bool) -> list[Modality]:
+    modalities: list[Modality] = []
+    if eye:
+        modalities.extend((Modality.IMAGE, Modality.VIDEO_VISUAL))
+    if ear:
+        modalities.extend((Modality.VIDEO_AUDIO, Modality.AUDIO, Modality.MUSIC))
+    return modalities
+
+
+def _write_verified_routes(
+    services: AppServices,
+    provider_id: str,
+    selected_modalities: Sequence[Modality],
+    input_fn: InputFn,
+) -> None:
+    """Write primaries and only individually authorized cross-Provider fallbacks."""
+    latest = services.config_store.load()
+    primary = latest.providers[provider_id]
+    changed = False
+    for modality in selected_modalities:
+        if not primary.verified_capabilities.get(modality, False):
+            continue
+        fallbacks: list[ProviderRef] = []
+        for fallback_id, fallback in sorted(latest.providers.items()):
+            if fallback_id == provider_id or not fallback.verified_capabilities.get(
+                modality,
+                False,
+            ):
+                continue
+            authorized = _optional_yes(
+                input_fn,
+                f"Authorize {fallback_id} as cross-Provider fallback for "
+                f"{modality.value}? [y/N]: ",
+            )
+            if authorized:
+                fallbacks.append(ProviderRef(provider=fallback_id, authorized=True))
+        setattr(
+            latest.routes,
+            modality.value,
+            RouteConfig(primary=provider_id, fallbacks=fallbacks),
+        )
+        changed = True
+    if changed:
+        services.config_store.save(latest)
+
+
 def run_configure(
     services: AppServices,
     input_fn: InputFn,
     secret_input_fn: InputFn,
     output: OutputFn,
+    verify_fn: ConfigureVerifyFn = verify_provider_capabilities,
 ) -> int:
     """Collect one provider locally and persist only its credential reference."""
     output(
-        "Capabilities: Gemini may understand image, video, audio, and music; "
-        "MiniMax-M3 is an image/native-video eye by default; custom capabilities "
-        "are declarations only and remain unverified."
+        "Roles: Gemini can be both eye and ear for image, video, audio, and music. "
+        "MiniMax-M3 is an image/native-video eye by default and is not an ear by "
+        "default. Custom capabilities are "
+        "declarations only until each selected modality passes verification."
     )
     output(
         "Privacy: use env:VARIABLE_NAME for an environment-only credential, or enter "
@@ -193,19 +270,29 @@ def run_configure(
                 for configured in config.providers.values()
             )
         ):
-            output("Configuration was not saved: use a new provider and credential reference.")
+            output(
+                "Configuration was not saved: use a new provider and credential reference."
+            )
             return 1
         secret: str | None = None
         if credential_ref is not None:
             try:
                 occupied = services.secret_store.exists(credential_ref)
             except SensoryError:
-                output("Configuration was not saved: local credential storage is unavailable.")
+                output(
+                    "Configuration was not saved: local credential storage is unavailable."
+                )
                 return 1
             if occupied:
-                output("Configuration was not saved: the local credential reference is occupied.")
+                output(
+                    "Configuration was not saved: the local credential reference is occupied."
+                )
                 return 1
             secret = secret_input_fn("API key (local input, hidden): ")
+        eye = _optional_yes(input_fn, "Use this Provider as the eye? [y/N]: ")
+        ear = False
+        if provider.adapter != "minimax-m3":
+            ear = _optional_yes(input_fn, "Use this Provider as the ear? [y/N]: ")
     except (EOFError, KeyboardInterrupt, StopIteration, _ConfigurationCancelled):
         output("Configuration cancelled; nothing was saved.")
         return 1
@@ -218,7 +305,9 @@ def run_configure(
         try:
             services.secret_store.set(credential_ref, secret)
         except SensoryError:
-            output("Configuration was not saved: local credential storage is unavailable.")
+            output(
+                "Configuration was not saved: local credential storage is unavailable."
+            )
             return 1
         stored_credential_ref = credential_ref
 
@@ -243,14 +332,60 @@ def run_configure(
 
     output(f"Configured provider: {provider_id}")
     if provider.api_key_env is not None:
-        state = "available" if _credential_available(services, provider_id, provider) else "missing"
+        state = (
+            "available"
+            if _credential_available(services, provider_id, provider)
+            else "missing"
+        )
         output(f"Credential: environment variable {state} (name and value are hidden).")
     else:
         output("Credential: stored locally (value and reference are hidden).")
+
+    selected_modalities = [
+        modality
+        for modality in _role_modalities(eye=eye, ear=ear)
+        if provider.declared_capabilities.get(modality, False)
+    ]
+    if selected_modalities:
+        output(
+            "Verification notice: this sends tiny test media to the selected Provider "
+            "and may use a small amount of Provider quota."
+        )
+        try:
+            verify_now = _optional_yes(
+                input_fn,
+                "Run capability verification now? [y/N]: ",
+            )
+        except (EOFError, KeyboardInterrupt, _ConfigurationCancelled, ValueError):
+            output(
+                "Verification was not started; the Provider remains saved without new routes."
+            )
+            return 0
+        if verify_now:
+
+            async def run_verification() -> dict[str, object]:
+                return await verify_fn(services, provider_id, selected_modalities)
+
+            result: dict[str, object] = asyncio.run(run_verification())
+            if result.get("status") == "error":
+                output("Verification did not pass; no unverified route was written.")
+            try:
+                _write_verified_routes(
+                    services,
+                    provider_id,
+                    selected_modalities,
+                    input_fn,
+                )
+            except (EOFError, KeyboardInterrupt, _ConfigurationCancelled, ValueError):
+                output(
+                    "Fallback authorization stopped; no implicit fallback was added."
+                )
     return 0
 
 
-def _credential_available(services: AppServices, provider_id: str, provider: ProviderConfig) -> bool:
+def _credential_available(
+    services: AppServices, provider_id: str, provider: ProviderConfig
+) -> bool:
     try:
         services.secret_store.get(
             provider.credential_ref or provider_id,
@@ -267,16 +402,33 @@ def run_status(services: AppServices, output: OutputFn) -> int:
         config = services.config_store.load()
     except SensoryError:
         output("Configuration: invalid")
-        output("Foundation provider perception: unavailable")
+        output("Verified sensory routes: unavailable")
         return 1
 
     output("Configuration: readable")
     if not config.providers:
         output("Providers: none")
     for provider_id, provider in sorted(config.providers.items()):
-        state = "available" if _credential_available(services, provider_id, provider) else "missing"
+        state = (
+            "available"
+            if _credential_available(services, provider_id, provider)
+            else "missing"
+        )
         output(f"Provider {provider_id}: credential {state}")
-    output("Foundation provider perception: unavailable (no working provider adapter yet)")
+    verified_routes = 0
+    for modality in Modality:
+        route = getattr(config.routes, modality.value)
+        if route is None:
+            continue
+        route_provider = config.providers.get(route.primary)
+        if route_provider is None or not route_provider.verified_capabilities.get(
+            modality, False
+        ):
+            continue
+        output(f"Verified {modality.value}: {route.primary}")
+        verified_routes += 1
+    if verified_routes == 0:
+        output("Verified sensory routes: none")
     return 0
 
 
@@ -329,8 +481,29 @@ def run_doctor(services: AppServices, output: OutputFn) -> int:
     return 0 if healthy else 1
 
 
-def run_self_test(services: AppServices, output: OutputFn) -> int:
-    """Report the local-only foundation verifier result without provider I/O."""
+def run_self_test(
+    services: AppServices,
+    output: OutputFn,
+    input_fn: InputFn = input,
+    *,
+    yes: bool = False,
+) -> int:
+    """Run a quota-bearing Provider self-test only after explicit confirmation."""
+    output(
+        "Usage notice: this sends tiny test media to configured Providers and may use "
+        "a small amount of Provider quota."
+    )
+    if not yes:
+        try:
+            confirmed = (
+                input_fn("Continue with the sensory self-test? [y/N]: ").strip().lower()
+            )
+        except (EOFError, KeyboardInterrupt):
+            output("Self-test cancelled; no Provider call was made.")
+            return 1
+        if confirmed not in {"y", "yes"}:
+            output("Self-test declined; no Provider call was made.")
+            return 1
     result = asyncio.run(sensory_self_test(services, list(Modality)))
     output(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 1 if result.get("status") == "error" else 0
@@ -344,7 +517,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers.add_parser("configure", help="Configure one provider locally.")
     subparsers.add_parser("status", help="Show redacted local setup status.")
     subparsers.add_parser("doctor", help="Run local-only setup diagnostics.")
-    subparsers.add_parser("self-test", help="Run the foundation capability self-test.")
+    self_test_parser = subparsers.add_parser(
+        "self-test",
+        help="Run the Provider capability self-test.",
+    )
+    self_test_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm Provider quota use without an interactive prompt.",
+    )
     args = parser.parse_args(argv)
     if args.version:
         print(f"cove-sensory-mcp {__version__}")
@@ -364,7 +545,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "doctor":
         return run_doctor(_build_services(), output=print)
     if args.command == "self-test":
-        return run_self_test(_build_services(), output=print)
+        return run_self_test(
+            _build_services(),
+            output=print,
+            input_fn=input,
+            yes=args.yes,
+        )
     parser.print_help()
     return 0
 

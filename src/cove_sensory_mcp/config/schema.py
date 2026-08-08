@@ -45,6 +45,7 @@ _HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}\Z")
 _MAX_EXTRA_HEADERS = 16
 _FORBIDDEN_EXTRA_HEADERS = frozenset(
     {
+        "accept-encoding",
         "authorization",
         "connection",
         "content-encoding",

@@ -214,23 +214,43 @@ def _declared_content_length(response: httpx.Response) -> None:
         raise _ResponseReadRejected
 
 
+def _validate_content_encoding(response: httpx.Response) -> None:
+    encodings = response.headers.get_list("content-encoding")
+    if not encodings:
+        return
+    if len(encodings) != 1 or encodings[0].strip().lower() != "identity":
+        raise _ResponseReadRejected
+
+
 async def _read_bounded_response(response: httpx.Response) -> bytes:
+    _validate_content_encoding(response)
     _declared_content_length(response)
     body = bytearray()
-    async for chunk in response.aiter_bytes():
+    async for chunk in response.aiter_raw():
         if len(chunk) > _MAX_RESPONSE_BYTES - len(body):
             raise _ResponseReadRejected
         body.extend(chunk)
     return bytes(body)
 
 
-def _structured_failure(payload: dict[str, Any]) -> _FailureKind | None:
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return None
+def _structured_error_kind(error: dict[str, Any]) -> _FailureKind | None:
     code = error.get("code", error.get("type"))
     if isinstance(code, str):
         normalized = code.strip().lower()
+        if normalized in {
+            "authentication_error",
+            "invalid_api_key",
+            "invalid_authentication",
+            "permission_denied",
+            "unauthorized",
+        }:
+            return _FailureKind.AUTH
+        if normalized in {
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "too_many_requests",
+        }:
+            return _FailureKind.UNAVAILABLE
         if normalized in {"content_filter", "prohibited_content", "safety_error"}:
             return _FailureKind.SAFETY
         if normalized in {
@@ -242,6 +262,14 @@ def _structured_failure(payload: dict[str, Any]) -> _FailureKind | None:
     message = error.get("message")
     if isinstance(message, str):
         normalized_message = message.strip().lower()
+        if normalized_message in {
+            "authentication failed",
+            "invalid api key",
+            "unauthorized",
+        }:
+            return _FailureKind.AUTH
+        if normalized_message in {"rate limit exceeded", "too many requests"}:
+            return _FailureKind.UNAVAILABLE
         if normalized_message in {"content policy", "safety policy", "unsafe media"}:
             return _FailureKind.SAFETY
         if normalized_message in {
@@ -253,17 +281,24 @@ def _structured_failure(payload: dict[str, Any]) -> _FailureKind | None:
     return None
 
 
-def _classify_response(status_code: int, payload: dict[str, Any] | None) -> _FailureKind:
+def _error_envelope_kind(
+    payload: dict[str, Any],
+) -> tuple[bool, _FailureKind | None]:
+    if "error" not in payload or payload["error"] is None:
+        return False, None
+    error = payload["error"]
+    if not isinstance(error, dict):
+        return True, None
+    return True, _structured_error_kind(error)
+
+
+def _classify_response(status_code: int) -> _FailureKind:
     if status_code in {401, 403}:
         return _FailureKind.AUTH
     if status_code in {408, 504}:
         return _FailureKind.TIMEOUT
     if status_code == 415:
         return _FailureKind.CAPABILITY
-    if payload is not None:
-        structured = _structured_failure(payload)
-        if structured is not None:
-            return structured
     return _FailureKind.UNAVAILABLE
 
 
@@ -378,7 +413,10 @@ class OpenAICompatibleProvider:
         self._declared_capabilities = declared
         self._endpoint = f"{config.base_url}{endpoint_path}"
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(follow_redirects=False)
+        self._client = client or httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+        )
 
     def _max_bytes(self) -> int:
         return self._config.adapter_options.inline_max_bytes or _DEFAULT_MAX_BYTES
@@ -400,6 +438,7 @@ class OpenAICompatibleProvider:
 
     def _headers(self, credential: str) -> dict[str, str]:
         headers = {
+            "accept-encoding": "identity",
             "authorization": f"Bearer {credential}",
             "content-type": "application/json",
         }
@@ -532,8 +571,16 @@ class OpenAICompatibleProvider:
             raise _public_error(_FailureKind.UNAVAILABLE)
         response_payload = _decode_payload(response_body)
         response_body = b""
+        if response_payload is not None:
+            error_present, error_kind = _error_envelope_kind(response_payload)
+            if error_present:
+                if error_kind is not None:
+                    raise _public_error(error_kind)
+                if response_success:
+                    raise _response_error()
+                raise _public_error(_classify_response(response_status))
         if not response_success:
-            raise _public_error(_classify_response(response_status, response_payload))
+            raise _public_error(_classify_response(response_status))
         if response_payload is None:
             raise _response_error()
         response_text = _extract_response_text(response_payload)

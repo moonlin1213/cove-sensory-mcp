@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
 import json
 import logging
+import zlib
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, cast
@@ -12,6 +15,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+import cove_sensory_mcp.providers.openai_compatible as compatible_module
 from cove_sensory_mcp.config.schema import AdapterOptions, AppConfig, ProviderConfig
 from cove_sensory_mcp.config.secrets import MemorySecretStore
 from cove_sensory_mcp.config.store import ConfigStore
@@ -120,13 +124,32 @@ def _store() -> MemorySecretStore:
     return store
 
 
+class StaticAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.body
+
+
 def _client(
     handler: Callable[[httpx.Request], object],
     *,
     follow_redirects: bool = False,
 ) -> httpx.AsyncClient:
+    async def streaming_handler(request: httpx.Request) -> object:
+        response = handler(request)
+        if isinstance(response, httpx.Response) and response.is_stream_consumed:
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers.raw,
+                stream=StaticAsyncStream(response.content),
+                extensions=response.extensions,
+            )
+        return response
+
     return httpx.AsyncClient(
-        transport=httpx.MockTransport(cast(Any, handler)),
+        transport=httpx.MockTransport(cast(Any, streaming_handler)),
         follow_redirects=follow_redirects,
     )
 
@@ -260,6 +283,7 @@ async def test_each_named_mode_emits_its_exact_bounded_request_shape(
     assert len(captured) == 1
     assert captured[0].url == "https://custom.example.test/api/v1/chat/completions"
     assert captured[0].headers["authorization"] == f"Bearer {_PRIMARY_SECRET}"
+    assert captured[0].headers["accept-encoding"] == "identity"
     assert json.loads(captured[0].content) == {
         "model": "custom-model",
         "max_tokens": 768,
@@ -364,6 +388,7 @@ async def test_joint_or_mismatched_request_fails_before_secret_file_and_network(
         pytest.param({"Connection": "SAFE_ENV"}, "Connection", id="connection"),
         pytest.param({"Cookie": "SAFE_ENV"}, "Cookie", id="cookie"),
         pytest.param({"Authorization": "SAFE_ENV"}, "Authorization", id="primary-auth-override"),
+        pytest.param({"aCcEpT-EnCoDiNg": "SAFE_ENV"}, "aCcEpT-EnCoDiNg", id="compression-override"),
         pytest.param({"X Good": "SAFE_ENV"}, "X Good", id="whitespace"),
         pytest.param({"X-Good\r\nX-Evil": "SAFE_ENV"}, "X-Evil", id="crlf"),
         pytest.param({"X-Custom": "literal-secret-value"}, "literal-secret-value", id="literal-value"),
@@ -594,6 +619,155 @@ class BlockingAsyncStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class RejectIfIteratedStream(httpx.AsyncByteStream):
+    def __init__(self, compressed: bytes) -> None:
+        self.compressed = compressed
+        self.iterated = False
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.iterated = True
+        raise AssertionError("compressed response body must not be iterated")
+        yield self.compressed  # pragma: no cover - keeps this an async generator
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class RawOnlyResponse(httpx.Response):
+    async def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+        del chunk_size
+        raise AssertionError("adapter must use the raw response iterator")
+        yield b"unreachable"  # pragma: no cover - keeps this an async generator
+
+
+@pytest.mark.asyncio
+async def test_identity_response_uses_raw_iterator_and_closes(tmp_path: Path) -> None:
+    """Switching back to decoded iteration would reopen amplification before bounds."""
+    media = tmp_path / "raw-only.jpg"
+    media.write_bytes(b"image")
+    body = json.dumps(_chat_response(Modality.IMAGE)).encode("utf-8")
+    stream = TrackingAsyncStream([body])
+
+    async with _client(
+        lambda request: RawOnlyResponse(
+            200,
+            headers={"content-encoding": "identity"},
+            stream=stream,
+        )
+    ) as client:
+        result = await _provider(client, _config("image_url_data_uri")).sense(
+            _request(
+                media,
+                media_kind=MediaKind.IMAGE,
+                mime_type="image/jpeg",
+                modality=Modality.IMAGE,
+            )
+        )
+
+    assert result.observations[Modality.IMAGE].summary == "Direct evidence."
+    assert stream.yielded == 1
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "compressed"),
+    [
+        pytest.param(
+            "gzip",
+            gzip.compress(b"x" * (_MAX_RESPONSE_BYTES + 1)),
+            id="gzip-amplification",
+        ),
+        pytest.param(
+            "deflate",
+            zlib.compress(b"x" * (_MAX_RESPONSE_BYTES + 1)),
+            id="deflate-amplification",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_compressed_response_is_rejected_before_body_iteration(
+    tmp_path: Path,
+    content_encoding: str,
+    compressed: bytes,
+) -> None:
+    """Automatic decompression must not allocate an expanded body before our cap."""
+    media = tmp_path / "compressed.jpg"
+    media.write_bytes(b"image")
+    stream = RejectIfIteratedStream(compressed)
+
+    async with _client(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-encoding": content_encoding},
+            stream=stream,
+        )
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert caught.value.cause is None
+    assert stream.iterated is False
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param(
+            [("content-encoding", "")],
+            id="empty",
+        ),
+        pytest.param(
+            [("content-encoding", "gzip, identity")],
+            id="comma-list",
+        ),
+        pytest.param(
+            [
+                ("content-encoding", "identity"),
+                ("content-encoding", "identity"),
+            ],
+            id="duplicate-identity",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_or_multiple_content_encoding_is_rejected_unread(
+    tmp_path: Path,
+    headers: list[tuple[str, str]],
+) -> None:
+    """Ambiguous encoding metadata must not select any decoder or body path."""
+    media = tmp_path / "encoding.jpg"
+    media.write_bytes(b"image")
+    stream = RejectIfIteratedStream(b"private-compressed-marker")
+
+    async with _client(
+        lambda request: httpx.Response(200, headers=headers, stream=stream)
+    ) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert "private-compressed-marker" not in str(caught.value)
+    assert stream.iterated is False
+    assert stream.closed is True
+
+
 @pytest.mark.asyncio
 async def test_response_bytes_are_stream_bounded_and_response_closes(tmp_path: Path) -> None:
     """An absent or lying Content-Length must not bypass the decoded response cap."""
@@ -705,6 +879,138 @@ async def test_transport_failures_are_sanitized(
     assert "private-" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    ("error_code", "want_code", "want_retryable"),
+    [
+        pytest.param(
+            "content_filter",
+            ErrorCode.PROVIDER_SAFETY_REJECTED,
+            False,
+            id="safety",
+        ),
+        pytest.param(
+            "unsupported_media_type",
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            False,
+            id="capability",
+        ),
+        pytest.param(
+            "invalid_api_key",
+            ErrorCode.PROVIDER_AUTH_FAILED,
+            False,
+            id="auth",
+        ),
+        pytest.param(
+            "rate_limit_exceeded",
+            ErrorCode.PROVIDER_UNAVAILABLE,
+            True,
+            id="rate",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_success_status_error_envelope_precedes_valid_report(
+    tmp_path: Path,
+    error_code: str,
+    want_code: ErrorCode,
+    want_retryable: bool,
+) -> None:
+    """A 2xx status must not let a Provider error masquerade as an observation."""
+    media = tmp_path / "error-envelope.jpg"
+    media.write_bytes(b"image")
+    payload = _chat_response(Modality.IMAGE, summary="must be ignored")
+    payload["error"] = {
+        "code": error_code,
+        "message": "private-recognized-error-detail",
+    }
+
+    async with _client(lambda request: httpx.Response(200, json=payload)) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert caught.value.code is want_code
+    assert caught.value.retryable is want_retryable
+    assert caught.value.cause is None
+    assert "must be ignored" not in str(caught.value)
+    assert "private-recognized-error-detail" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "error_envelope",
+    [
+        pytest.param(
+            {
+                "code": "private-unknown-error-code",
+                "message": "private-unknown-error-detail",
+            },
+            id="unknown-object",
+        ),
+        pytest.param("private-malformed-error-string", id="string"),
+        pytest.param(["private-malformed-error-list"], id="list"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unknown_or_malformed_success_error_envelope_rejects_privately(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    error_envelope: object,
+) -> None:
+    """Malformed non-null errors must reject instead of falling through to choices."""
+    media = tmp_path / "private-error.jpg"
+    media.write_bytes(b"image")
+    payload = _chat_response(Modality.IMAGE, summary="must not be accepted")
+    payload["error"] = error_envelope
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(lambda request: httpx.Response(200, json=payload)) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert caught.value.retryable is False
+    assert caught.value.cause is None
+    diagnostics = f"{caught.value}\n" + "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+    assert "private-" not in diagnostics
+    assert "must not be accepted" not in diagnostics
+
+
+@pytest.mark.asyncio
+async def test_null_error_envelope_does_not_replace_valid_success(tmp_path: Path) -> None:
+    """Only a present non-null error envelope changes compatible success handling."""
+    media = tmp_path / "null-error.jpg"
+    media.write_bytes(b"image")
+    payload = _chat_response(Modality.IMAGE)
+    payload["error"] = None
+
+    async with _client(lambda request: httpx.Response(200, json=payload)) as client:
+        result = await _provider(client, _config("image_url_data_uri")).sense(
+            _request(
+                media,
+                media_kind=MediaKind.IMAGE,
+                mime_type="image/jpeg",
+                modality=Modality.IMAGE,
+            )
+        )
+
+    assert result.observations[Modality.IMAGE].summary == "Direct evidence."
+
+
 @pytest.mark.asyncio
 async def test_only_documented_text_blocks_are_extracted_not_thinking(tmp_path: Path) -> None:
     """Recursive text harvesting could expose hidden reasoning as a sensory report."""
@@ -775,30 +1081,82 @@ async def test_deep_report_json_is_mapped_without_raw_recursion_error(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_borrowed_client_remains_open_and_owned_client_closes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Closing borrowed clients breaks composition; leaking owned clients leaks sockets."""
+async def test_borrowed_client_remains_open() -> None:
+    """An injected client and its caller-controlled transport policy remain borrowed."""
     borrowed = _client(lambda request: httpx.Response(500))
     provider = _provider(borrowed, _config("image_url_data_uri"))
     await provider.aclose()
     assert borrowed.is_closed is False
     await borrowed.aclose()
 
-    for environment_name in (
-        "ALL_PROXY",
+
+@pytest.mark.asyncio
+async def test_owned_client_ignores_ambient_proxies_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient proxies must never receive Provider credentials, headers, or media."""
+    media = tmp_path / "owned.jpg"
+    media.write_bytes(b"owned-media-secret")
+    proxy_marker = "ambient-proxy-secret"
+    custom_header = "custom-header-secret"
+    monkeypatch.setenv(
         "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "all_proxy",
-        "https_proxy",
-        "http_proxy",
-    ):
-        monkeypatch.delenv(environment_name, raising=False)
+        f"https://proxy-user:{proxy_marker}@proxy.example.test:8443",
+    )
+    monkeypatch.setenv(
+        "ALL_PROXY",
+        f"socks5://proxy-user:{proxy_marker}@proxy.example.test:1080",
+    )
+    monkeypatch.setenv(_EXTRA_HEADER_ENV, custom_header)
+    direct_requests: list[httpx.Request] = []
+    constructor_kwargs: list[dict[str, object]] = []
+    real_async_client = httpx.AsyncClient
+
+    def direct_handler(request: httpx.Request) -> httpx.Response:
+        direct_requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=StaticAsyncStream(
+                json.dumps(_chat_response(Modality.IMAGE)).encode("utf-8")
+            ),
+        )
+
+    def client_factory(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        constructor_kwargs.append(dict(kwargs))
+        if kwargs.get("trust_env") is not False:
+            raise RuntimeError("owned client inherited ambient proxy settings")
+        return real_async_client(
+            *args,
+            transport=httpx.MockTransport(direct_handler),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(compatible_module.httpx, "AsyncClient", client_factory)
     owned = OpenAICompatibleProvider(
         provider_id="custom",
-        config=_config("image_url_data_uri"),
+        config=_config(
+            "image_url_data_uri",
+            extra_headers_env={"X-Tenant-Token": _EXTRA_HEADER_ENV},
+        ),
         secret_store=_store(),
+    )
+    result = await owned.sense(
+        _request(
+            media,
+            media_kind=MediaKind.IMAGE,
+            mime_type="image/jpeg",
+            modality=Modality.IMAGE,
+        )
     )
     await owned.aclose()
     await owned.aclose()
+
+    assert result.observations[Modality.IMAGE].summary == "Direct evidence."
+    assert constructor_kwargs == [{"follow_redirects": False, "trust_env": False}]
+    assert len(direct_requests) == 1
+    assert direct_requests[0].headers["authorization"] == f"Bearer {_PRIMARY_SECRET}"
+    assert direct_requests[0].headers["x-tenant-token"] == custom_header
+    assert base64.b64encode(b"owned-media-secret") in direct_requests[0].content
     assert cast(Any, owned)._client.is_closed is True

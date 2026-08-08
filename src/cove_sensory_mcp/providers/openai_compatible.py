@@ -595,10 +595,12 @@ class OpenAICompatibleProvider:
             close_failure, close_interrupted = await _close_response_context(
                 response_context
             )
-            if primary_failure is not None:
+            if isinstance(primary_failure, asyncio.CancelledError):
                 raise primary_failure
             if close_interrupted:
                 raise asyncio.CancelledError
+            if primary_failure is not None:
+                raise primary_failure
             if close_failure is not None:
                 raise close_failure
         except asyncio.CancelledError:

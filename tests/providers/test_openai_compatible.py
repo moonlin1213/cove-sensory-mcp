@@ -870,6 +870,58 @@ async def test_response_close_survives_repeated_cancellation(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_cancellation_during_close_precedes_primary_response_error(
+    tmp_path: Path,
+) -> None:
+    """A caller cancellation during cleanup must win after cleanup reaches terminal."""
+    media = tmp_path / "primary-error-cancel.jpg"
+    media.write_bytes(b"image")
+    stream = DelayedCloseAsyncStream()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop_contexts: list[dict[str, object]] = []
+    loop.set_exception_handler(
+        lambda active_loop, context: loop_contexts.append(context)
+    )
+
+    try:
+        async with _client(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-encoding": "gzip"},
+                stream=stream,
+            )
+        ) as client:
+            task = asyncio.create_task(
+                _provider(client, _config("image_url_data_uri")).sense(
+                    _request(
+                        media,
+                        media_kind=MediaKind.IMAGE,
+                        mime_type="image/jpeg",
+                        modality=Modality.IMAGE,
+                    )
+                )
+            )
+            await stream.close_started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            done_before_close = task.done()
+            stream.close_gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert done_before_close is False
+    assert stream.close_calls == 1
+    assert stream.closed is True
+    assert loop_contexts == []
+
+
+@pytest.mark.asyncio
 async def test_response_close_failure_is_reported_without_masking_primary_error(
     tmp_path: Path,
 ) -> None:

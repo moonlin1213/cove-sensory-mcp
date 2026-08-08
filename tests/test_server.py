@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import subprocess
 import sys
 
@@ -166,6 +167,10 @@ async def test_invalid_self_test_modalities_return_only_a_bounded_public_error(
         assert raw_detail not in public_wire
 
 
+@pytest.mark.skipif(
+    platform.system() not in {"Darwin", "Windows"},
+    reason="The local MCP server supports macOS and Windows.",
+)
 def test_serve_stdout_contains_only_mcp_json(tmp_path) -> None:
     """A plain-text diagnostic on stdout would corrupt the line-framed MCP transport."""
     request = {

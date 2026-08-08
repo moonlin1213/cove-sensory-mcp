@@ -157,7 +157,7 @@ def test_main_print_config_emits_stdio_command(capsys: pytest.CaptureFixture[str
     assert main(["print-config", "--client", "generic", "--executable", "/opt/cove"]) == 0
     rendered = json.loads(capsys.readouterr().out)
     assert rendered["mcpServers"]["cove-sensory"] == {
-        "command": "/opt/cove", "args": ["serve"]
+        "command": str(Path("/opt/cove").resolve(strict=False)), "args": ["serve"]
     }
 
 

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import wave
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from cove_sensory_mcp.models import Modality
@@ -36,6 +38,10 @@ def test_packaged_assets_match_manifest_and_are_usable() -> None:
     ).resolve()
 
 
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None,
+    reason="Regenerating the committed test video requires a user-supplied FFmpeg.",
+)
 def test_generator_is_reproducible_with_same_runtime(tmp_path: Path) -> None:
     first, second = tmp_path / "one", tmp_path / "two"
     for output in (first, second):

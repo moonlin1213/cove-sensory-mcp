@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).parents[2]
 
@@ -20,6 +23,7 @@ def test_installers_are_current_user_scoped_confirm_path_and_preserve_data() -> 
     assert "rollback" in mac.lower() and "rollback" in windows.lower()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="The macOS installer runs on macOS.")
 def test_macos_installer_verifies_and_activates_inside_injected_home(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

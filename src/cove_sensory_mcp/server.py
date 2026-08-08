@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer as FastMCP
 from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, InputRequiredResult, TextContent, ToolAnnotations
+from pydantic import AfterValidator, Field
 
 from cove_sensory_mcp.errors import ErrorCode, SensoryError, error_result
 from cove_sensory_mcp.models import Modality
@@ -23,18 +24,43 @@ from cove_sensory_mcp.tools.setup import (
 
 RequestedModality = Literal["image", "video_visual", "video_audio", "audio", "music"]
 
+
+def _require_unique_modalities(
+    modalities: list[RequestedModality],
+) -> list[RequestedModality]:
+    if len(set(modalities)) != len(modalities):
+        raise ValueError("modalities must be unique")
+    return modalities
+
+
+RequestedModalities = Annotated[
+    list[RequestedModality],
+    Field(
+        min_length=1,
+        max_length=len(Modality),
+        json_schema_extra={"uniqueItems": True},
+    ),
+    AfterValidator(_require_unique_modalities),
+]
+
 _SAFE_ANNOTATIONS = ToolAnnotations(
     read_only_hint=True,
     destructive_hint=False,
     idempotent_hint=True,
     open_world_hint=False,
 )
+_SELF_TEST_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,
+    open_world_hint=True,
+)
 _STATUS_DESCRIPTION = "Inspect local configuration status; read-only setup tools never accept credentials."
 _GUIDE_DESCRIPTION = "Inspect local configuration setup options; read-only setup tools never accept credentials."
 _SELF_TEST_DESCRIPTION = (
     "Inspect local configuration readiness by sending tiny test media to the configured "
-    "Provider; this may use a small amount of Provider quota. Read-only setup tools never "
-    "accept credentials."
+    "Provider; this may use a small amount of Provider quota and update verified state. "
+    "This tool never accepts credentials."
 )
 _INVALID_ARGUMENTS_MESSAGE = "The tool arguments are invalid."
 
@@ -92,9 +118,9 @@ def create_server(services: AppServices) -> FastMCP[None]:
     @server.tool(
         name="sensory_self_test",
         description=_SELF_TEST_DESCRIPTION,
-        annotations=_SAFE_ANNOTATIONS,
+        annotations=_SELF_TEST_ANNOTATIONS,
     )
-    async def self_test_tool(modalities: list[RequestedModality]) -> dict[str, object]:
+    async def self_test_tool(modalities: RequestedModalities) -> dict[str, object]:
         return await sensory_self_test(
             services, [Modality(modality) for modality in modalities]
         )

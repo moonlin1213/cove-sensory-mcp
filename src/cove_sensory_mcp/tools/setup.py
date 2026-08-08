@@ -21,6 +21,7 @@ from cove_sensory_mcp.verification.assets import SelfTestAssetStore
 
 _SETUP_COMMAND = "cove-sensory-mcp configure"
 _NOT_VERIFIED_REASON = "No verified provider is configured."
+_INVALID_MODALITIES_MESSAGE = "The self-test modalities are invalid."
 _PROVIDER_OPTIONS: list[dict[str, object]] = [
     {
         "id": "gemini",
@@ -136,6 +137,16 @@ async def sensory_self_test(
     assets: SelfTestAssetStore | None = None,
 ) -> dict[str, object]:
     """Delegate a requested self-test to an injected verifier implementation."""
+    if (
+        type(modalities) is not list
+        or not modalities
+        or len(modalities) > len(Modality)
+        or any(type(modality) is not Modality for modality in modalities)
+        or len(set(modalities)) != len(modalities)
+    ):
+        return error_result(
+            SensoryError(ErrorCode.CONFIG_INVALID, _INVALID_MODALITIES_MESSAGE)
+        )
     if verifier is not None:
         return _public_result(await verifier.verify(modalities))
     try:

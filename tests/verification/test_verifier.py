@@ -38,17 +38,17 @@ class CountingConfigStore(ConfigStore):
         self.save_calls += 1
         super().save(config)
 
+    def update(self, mutator: Callable[[AppConfig], AppConfig | None]) -> AppConfig:
+        self.save_calls += 1
+        return super().update(mutator)
+
 
 def _provider_config(
     *,
     adapter: str = "gemini",
     verified: tuple[Modality, ...] = (),
 ) -> ProviderConfig:
-    declared = {
-        Modality.IMAGE: True,
-        Modality.VIDEO_VISUAL: True,
-        Modality.AUDIO: True,
-    }
+    declared = {modality: True for modality in Modality}
     return ProviderConfig(
         adapter=adapter,
         model="test-model",
@@ -124,13 +124,26 @@ def assets(tmp_path: Path) -> SelfTestAssetStore:
                 MediaKind.VIDEO,
                 2.0,
             ),
+            Modality.VIDEO_AUDIO: PreparedMedia(
+                video,
+                "video/mp4",
+                MediaKind.VIDEO,
+                2.0,
+            ),
             Modality.AUDIO: PreparedMedia(
                 audio,
                 "audio/wav",
                 MediaKind.AUDIO,
                 1.0,
             ),
-        }
+            Modality.MUSIC: PreparedMedia(
+                audio,
+                "audio/wav",
+                MediaKind.AUDIO,
+                1.0,
+            ),
+        },
+        trusted_root=tmp_path,
     )
 
 
@@ -255,6 +268,104 @@ async def test_video_position_without_motion_does_not_verify_native_video(
     assert result[0].verified is False
 
 
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "No motion; a red ball remains on the right.",
+        "The red ball does not move to the right.",
+        "The red ball is not moving right.",
+        "The red ball never moves right.",
+        "The red ball remains still on the right.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_targeted_motion_negations_never_verify_video(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    summary: str,
+) -> None:
+    store = _configured_store(tmp_path, adapter="minimax-m3")
+    provider = SemanticProvider({Modality.VIDEO_VISUAL: summary})
+
+    result = await _verifier(store, provider, assets).verify(
+        "vision", [Modality.VIDEO_VISUAL]
+    )
+
+    assert result[0].verified is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_positive_motion_with_direction_verifies_video(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+) -> None:
+    store = _configured_store(tmp_path, adapter="minimax-m3")
+    provider = SemanticProvider(
+        {Modality.VIDEO_VISUAL: "The red ball moves to the right."}
+    )
+
+    result = await _verifier(store, provider, assets).verify(
+        "vision", [Modality.VIDEO_VISUAL]
+    )
+
+    assert result[0].verified is True
+
+
+@pytest.mark.parametrize(
+    ("modality", "passing", "failing"),
+    [
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chimes twice.",
+            "There is generic audio in the video.",
+        ),
+        (
+            Modality.MUSIC,
+            "A piano plays an ascending scale.",
+            "Music can be heard.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_video_audio_and_music_require_direct_semantic_facts(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    passing: str,
+    failing: str,
+) -> None:
+    store = _configured_store(tmp_path)
+    passed = await _verifier(
+        store, SemanticProvider({modality: passing}), assets
+    ).verify("vision", [modality])
+    failed = await _verifier(
+        store, SemanticProvider({modality: failing}), assets
+    ).verify("vision", [modality])
+
+    assert passed[0].verified is True
+    assert failed[0].verified is False
+
+
+@pytest.mark.asyncio
+async def test_undeclared_modality_makes_no_provider_call_or_config_write(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+) -> None:
+    store = CountingConfigStore(tmp_path / "config.yaml")
+    provider_config = _provider_config()
+    provider_config.declared_capabilities[Modality.MUSIC] = False
+    store.save(AppConfig(providers={"vision": provider_config}))
+    store.save_calls = 0
+    provider = SemanticProvider({Modality.MUSIC: "A piano scale rises upward."})
+
+    with pytest.raises(SensoryError) as caught:
+        await _verifier(store, provider, assets).verify("vision", [Modality.MUSIC])
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert provider.requests == []
+    assert store.save_calls == 0
+
+
 @pytest.mark.asyncio
 async def test_batch_updates_requested_capabilities_once_and_preserves_unrelated_state(
     tmp_path: Path,
@@ -330,6 +441,37 @@ async def test_verifier_reloads_before_atomic_write_to_preserve_unrelated_change
 
 
 @pytest.mark.asyncio
+async def test_provider_identity_conflict_during_remote_call_aborts_without_overwrite(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+) -> None:
+    """A changed model must not receive verification earned by an earlier model."""
+    store = _configured_store(tmp_path)
+    external = ConfigStore(store.path)
+
+    def change_model(_: ProviderRequest) -> None:
+        def mutate(config: AppConfig) -> None:
+            config.providers["vision"].model = "late-model"
+            config.allowed_media_roots.append("late-setting")
+
+        external.update(mutate)
+
+    provider = SemanticProvider(
+        {Modality.IMAGE: "A blue triangle is visible."},
+        before_return=change_model,
+    )
+
+    with pytest.raises(SensoryError) as caught:
+        await _verifier(store, provider, assets).verify("vision", [Modality.IMAGE])
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    saved = store.load()
+    assert saved.providers["vision"].model == "late-model"
+    assert saved.providers["vision"].verified_capabilities == {}
+    assert saved.allowed_media_roots == ["late-setting"]
+
+
+@pytest.mark.asyncio
 async def test_cancellation_and_local_asset_errors_never_partially_write(
     tmp_path: Path,
     assets: SelfTestAssetStore,
@@ -343,15 +485,17 @@ async def test_cancellation_and_local_asset_errors_never_partially_write(
 
     assert store.save_calls == 0
 
-    missing_assets = SelfTestAssetStore({})
+    missing_assets = SelfTestAssetStore({}, trusted_root=tmp_path)
+    missing_provider = SemanticProvider({Modality.IMAGE: "blue triangle"})
     with pytest.raises(SensoryError) as caught:
         await _verifier(
             store,
-            SemanticProvider({Modality.IMAGE: "blue triangle"}),
+            missing_provider,
             missing_assets,
         ).verify("vision", [Modality.IMAGE])
 
     assert caught.value.code is ErrorCode.SOURCE_NOT_FOUND
+    assert missing_provider.requests == []
     assert store.save_calls == 0
 
 

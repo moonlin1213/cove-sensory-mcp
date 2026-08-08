@@ -43,17 +43,25 @@ async def test_setup_tools_advertise_local_read_only_safety(
     """Unsafe descriptions or mutation hints could invite credential-bearing calls."""
     tools = await create_server(services).list_tools()
 
-    for tool in tools:
+    safe_tools = [tool for tool in tools if tool.name != "sensory_self_test"]
+    for tool in safe_tools:
         assert "inspect local configuration" in tool.description.lower()
         assert "never accept credentials" in tool.description.lower()
         assert tool.annotations is not None
         assert tool.annotations.read_only_hint is True
         assert tool.annotations.destructive_hint is False
+        assert tool.annotations.idempotent_hint is True
+        assert tool.annotations.open_world_hint is False
 
     self_test = next(tool for tool in tools if tool.name == "sensory_self_test")
     description = self_test.description.lower()
     assert "tiny test media" in description
     assert "provider quota" in description
+    assert self_test.annotations is not None
+    assert self_test.annotations.read_only_hint is False
+    assert self_test.annotations.destructive_hint is True
+    assert self_test.annotations.idempotent_hint is False
+    assert self_test.annotations.open_world_hint is True
 
 
 @pytest.mark.asyncio
@@ -74,8 +82,35 @@ async def test_setup_tools_expose_only_explicit_public_inputs(
             },
             "title": "Modalities",
             "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "uniqueItems": True,
         }
     }
+
+
+@pytest.mark.parametrize("modalities", [[], ["image", "image"]])
+@pytest.mark.asyncio
+async def test_empty_and_duplicate_mcp_modalities_return_stable_invalid_arguments(
+    services: AppServices,
+    modalities: list[str],
+) -> None:
+    async with Client(create_server(services), mode="legacy") as client:
+        result = await client.call_tool(
+            "sensory_self_test",
+            {"modalities": modalities},
+        )
+
+    assert result.is_error is True
+    assert result.structured_content == {
+        "status": "error",
+        "error": {
+            "code": "CONFIG_INVALID",
+            "message": "The tool arguments are invalid.",
+            "retryable": False,
+        },
+    }
+    assert services.config_store.load().providers == {}
 
 
 @pytest.mark.parametrize(

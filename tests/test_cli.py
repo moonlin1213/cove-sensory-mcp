@@ -19,7 +19,8 @@ from cove_sensory_mcp.config.paths import AppPaths
 from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig
 from cove_sensory_mcp.config.secrets import MemorySecretStore
 from cove_sensory_mcp.config.store import ConfigStore
-from cove_sensory_mcp.models import Modality
+from cove_sensory_mcp.errors import ErrorCode, SensoryError
+from cove_sensory_mcp.models import Modality, RouteConfig
 from cove_sensory_mcp.services import AppServices
 
 
@@ -238,6 +239,51 @@ def test_configure_cross_provider_fallback_requires_explicit_authorization(
     fallback_prompts = [prompt for prompt in prompts if "fallback" in prompt.lower()]
     assert len(fallback_prompts) == 1
     assert "audio" in fallback_prompts[0].lower()
+
+
+def test_route_prompt_collects_decision_before_short_update_and_rejects_late_conflict(
+    tmp_services: AppServices,
+) -> None:
+    """A route changed during user input must survive instead of being overwritten."""
+    primary = ProviderConfig(
+        adapter="gemini",
+        model="primary-model",
+        credential_ref="primary-ref",
+        declared_capabilities={Modality.AUDIO: True},
+        verified_capabilities={Modality.AUDIO: True},
+    )
+    fallback = ProviderConfig(
+        adapter="gemini",
+        model="fallback-model",
+        credential_ref="fallback-ref",
+        declared_capabilities={Modality.AUDIO: True},
+        verified_capabilities={Modality.AUDIO: True},
+    )
+    tmp_services.config_store.save(
+        AppConfig(providers={"primary": primary, "fallback": fallback})
+    )
+    external = ConfigStore(tmp_services.config_store.path)
+
+    def change_route_while_prompted(_: str) -> str:
+        def mutate(config: AppConfig) -> None:
+            config.routes.audio = RouteConfig(primary="fallback")
+            config.allowed_media_roots.append("late-setting")
+
+        external.update(mutate)
+        return "yes"
+
+    with pytest.raises(SensoryError) as caught:
+        cli._write_verified_routes(
+            tmp_services,
+            "primary",
+            [Modality.AUDIO],
+            change_route_while_prompted,
+        )
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    saved = tmp_services.config_store.load()
+    assert saved.routes.audio == RouteConfig(primary="fallback")
+    assert saved.allowed_media_roots == ["late-setting"]
 
 
 def test_configure_declined_verification_saves_provider_but_no_routes(
@@ -945,11 +991,11 @@ def test_configure_deletes_just_created_secret_when_config_save_fails(
     """A failed config write must not leave an orphan credential behind."""
     answers = iter(["gemini", "gemini-main", "gemini-test-model", "n"])
 
-    def fail_save(config: AppConfig) -> None:
-        del config
+    def fail_update(mutator: object) -> None:
+        del mutator
         raise OSError("private path must not print")
 
-    monkeypatch.setattr(tmp_services.config_store, "save", fail_save)
+    monkeypatch.setattr(tmp_services.config_store, "update", fail_update)
 
     assert (
         run_configure(

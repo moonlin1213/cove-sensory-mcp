@@ -48,7 +48,23 @@ _EXPECTED_FACT_GROUPS: dict[Modality, tuple[frozenset[str], ...]] = {
     Modality.VIDEO_VISUAL: (
         frozenset({"red", "crimson"}),
         frozenset({"ball", "sphere", "circle"}),
-        frozenset({"moves", "travels", "rolls", "crosses", "motion"}),
+        frozenset(
+            {
+                "move",
+                "moves",
+                "moving",
+                "travel",
+                "travels",
+                "traveling",
+                "travelling",
+                "roll",
+                "rolls",
+                "rolling",
+                "cross",
+                "crosses",
+                "crossing",
+            }
+        ),
         frozenset({"right", "rightward"}),
     ),
     Modality.VIDEO_AUDIO: (
@@ -64,6 +80,18 @@ _EXPECTED_FACT_GROUPS: dict[Modality, tuple[frozenset[str], ...]] = {
         frozenset({"ascending", "rising", "upward"}),
     ),
 }
+
+_NEGATED_VIDEO_MOTION = re.compile(
+    r"\b(?:"
+    r"no\s+(?:visible\s+|discernible\s+)?motion|"
+    r"does(?:\s+not|n't)\s+(?:move|travel|roll|cross)|"
+    r"never\s+(?:moves?|travels?|rolls?|crosses?)|"
+    r"(?:is\s+)?not\s+(?:moving|traveling|travelling|rolling|crossing)|"
+    r"isn't\s+(?:moving|traveling|travelling|rolling|crossing)|"
+    r"stationary|"
+    r"(?:remains?|stays?)\s+still"
+    r")\b"
+)
 
 
 def _config_error() -> SensoryError:
@@ -93,7 +121,10 @@ def _observation_text(observation: ObservationEnvelope) -> str:
 def _matches_expected_facts(
     modality: Modality, observation: ObservationEnvelope
 ) -> bool:
-    words = frozenset(re.findall(r"[a-z0-9]+", _observation_text(observation)))
+    text = _observation_text(observation)
+    if modality is Modality.VIDEO_VISUAL and _NEGATED_VIDEO_MOTION.search(text):
+        return False
+    words = frozenset(re.findall(r"[a-z0-9]+", text))
     return all(
         any(term in words for term in group)
         for group in _EXPECTED_FACT_GROUPS[modality]
@@ -205,32 +236,30 @@ class CapabilityVerifier:
         verified_at = self._now()
         if verified_at.tzinfo is None or verified_at.utcoffset() is None:
             raise _config_error()
-        latest = self._config_store.load()
-        try:
-            latest_provider = latest.providers[provider_id]
-        except KeyError:
-            raise _config_error() from None
-        if _provider_identity(latest_provider) != identity:
-            raise _config_error()
 
-        updated = latest.model_copy(deep=True)
-        updated_provider = updated.providers[provider_id]
-        for result in results:
-            if result.verified:
-                updated_provider.verified_capabilities[result.modality] = True
-            else:
-                updated_provider.verified_capabilities.pop(result.modality, None)
-        verified_modalities = {
-            modality
-            for modality, enabled in updated_provider.verified_capabilities.items()
-            if enabled
-        }
-        updated_provider.verified_joint_capabilities = [
-            joint
-            for joint in updated_provider.verified_joint_capabilities
-            if joint <= verified_modalities
-        ]
-        updated_provider.last_verified_at = verified_at.astimezone(UTC)
-        validated = AppConfig.model_validate(updated.model_dump(mode="python"))
-        self._config_store.save(validated)
+        def merge_results(latest: AppConfig) -> None:
+            try:
+                latest_provider = latest.providers[provider_id]
+            except KeyError:
+                raise _config_error() from None
+            if _provider_identity(latest_provider) != identity:
+                raise _config_error()
+            for result in results:
+                if result.verified:
+                    latest_provider.verified_capabilities[result.modality] = True
+                else:
+                    latest_provider.verified_capabilities.pop(result.modality, None)
+            verified_modalities = {
+                modality
+                for modality, enabled in latest_provider.verified_capabilities.items()
+                if enabled
+            }
+            latest_provider.verified_joint_capabilities = [
+                joint
+                for joint in latest_provider.verified_joint_capabilities
+                if joint <= verified_modalities
+            ]
+            latest_provider.last_verified_at = verified_at.astimezone(UTC)
+
+        self._config_store.update(merge_results)
         return results

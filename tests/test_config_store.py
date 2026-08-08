@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
 import yaml
+from filelock import Timeout
 from pydantic import ValidationError
 
 from cove_sensory_mcp.config.schema import AppConfig, ProviderConfig, RoutesConfig
 from cove_sensory_mcp.config.store import ConfigStore
 from cove_sensory_mcp.errors import ErrorCode, SensoryError
+from cove_sensory_mcp.models import Modality, RouteConfig
 
 
 def test_load_returns_version_one_config_when_file_is_missing(tmp_path: Path) -> None:
@@ -18,7 +21,9 @@ def test_load_returns_version_one_config_when_file_is_missing(tmp_path: Path) ->
     assert config == AppConfig(version=1)
 
 
-def test_save_and_load_round_trip_unicode_provider_and_windows_path(tmp_path: Path) -> None:
+def test_save_and_load_round_trip_unicode_provider_and_windows_path(
+    tmp_path: Path,
+) -> None:
     """Changing YAML serialization must not corrupt Unicode or Windows-style paths."""
     path = tmp_path / "config.yaml"
     expected = AppConfig(
@@ -40,7 +45,9 @@ def test_save_and_load_round_trip_unicode_provider_and_windows_path(tmp_path: Pa
     assert store.load() == expected
 
 
-def test_save_persists_credential_reference_without_secret_value(tmp_path: Path) -> None:
+def test_save_persists_credential_reference_without_secret_value(
+    tmp_path: Path,
+) -> None:
     """Replacing reference-only storage with plaintext credential storage must fail."""
     path = tmp_path / "config.yaml"
     fake_secret = "test-secret-never-persisted"
@@ -80,10 +87,140 @@ def test_save_replaces_destination_with_temporary_file_atomically(
     ConfigStore(path).save(AppConfig())
 
     assert replaced == [(tmp_path / "config.yaml.tmp", path)]
-    assert path.read_text(encoding="utf-8") == "version: 1\nproviders: {}\nroutes: {}\nlimits: {}\nallowed_media_roots: []\n"
+    assert (
+        path.read_text(encoding="utf-8")
+        == "version: 1\nproviders: {}\nroutes: {}\nlimits: {}\nallowed_media_roots: []\n"
+    )
 
 
-def test_malformed_yaml_raises_config_invalid_without_overwriting_file(tmp_path: Path) -> None:
+def test_two_store_instances_merge_racing_provider_route_and_settings_updates(
+    tmp_path: Path,
+) -> None:
+    """Separate processes must not lose late unrelated configuration updates."""
+    path = tmp_path / "config.yaml"
+    first = ConfigStore(path)
+    second = ConfigStore(path)
+    first.save(AppConfig())
+    start = threading.Barrier(3)
+    failures: list[BaseException] = []
+
+    def add_provider_and_route() -> None:
+        try:
+            start.wait()
+
+            def mutate(config: AppConfig) -> None:
+                config.providers["vision"] = ProviderConfig(
+                    adapter="gemini",
+                    model="test-model",
+                    credential_ref="test-ref",
+                    declared_capabilities={Modality.IMAGE: True},
+                    verified_capabilities={Modality.IMAGE: True},
+                )
+                config.routes.image = RouteConfig(primary="vision")
+
+            first.update(mutate)
+        except (
+            AssertionError,
+            SensoryError,
+            threading.BrokenBarrierError,
+        ) as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    def add_unrelated_setting() -> None:
+        try:
+            start.wait()
+            second.update(
+                lambda config: config.allowed_media_roots.append("D:/Shared Media")
+            )
+        except (
+            AssertionError,
+            SensoryError,
+            threading.BrokenBarrierError,
+        ) as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    threads = [
+        threading.Thread(target=add_provider_and_route),
+        threading.Thread(target=add_unrelated_setting),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert all(not thread.is_alive() for thread in threads)
+    saved = ConfigStore(path).load()
+    assert set(saved.providers) == {"vision"}
+    assert saved.routes.image == RouteConfig(primary="vision")
+    assert saved.allowed_media_roots == ["D:/Shared Media"]
+
+
+def test_update_mutator_conflict_aborts_without_overwriting_latest_config(
+    tmp_path: Path,
+) -> None:
+    """A caller's explicit conflict check must leave the latest file untouched."""
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.save(AppConfig(allowed_media_roots=["late-setting"]))
+
+    def reject_conflict(config: AppConfig) -> None:
+        assert config.allowed_media_roots == ["late-setting"]
+        raise SensoryError(ErrorCode.CONFIG_INVALID, "The configuration changed.")
+
+    with pytest.raises(SensoryError) as caught:
+        store.update(reject_conflict)
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert store.load().allowed_media_roots == ["late-setting"]
+
+
+def test_lock_and_io_failures_are_sanitized_without_private_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "private-config.yaml"
+    store = ConfigStore(path)
+
+    def fail_replace(source: Path, destination: Path) -> Path:
+        del source, destination
+        raise OSError(f"private path: {path}")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(SensoryError) as caught:
+        store.save(AppConfig())
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert str(caught.value) == "The configuration file could not be updated safely."
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_lock_timeout_is_sanitized_without_lock_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "private-config.yaml"
+    store = ConfigStore(path)
+
+    def fail_lock(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise Timeout(str(path.with_suffix(".yaml.lock")))
+
+    monkeypatch.setattr(
+        "cove_sensory_mcp.config.store.FileLock.acquire",
+        fail_lock,
+    )
+    with pytest.raises(SensoryError) as caught:
+        store.update(lambda config: config)
+
+    assert caught.value.code is ErrorCode.CONFIG_INVALID
+    assert str(caught.value) == "The configuration file could not be updated safely."
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_malformed_yaml_raises_config_invalid_without_overwriting_file(
+    tmp_path: Path,
+) -> None:
     """Changing invalid-load handling must not erase the user's recoverable file."""
     path = tmp_path / "config.yaml"
     original = "providers: [not: valid\n"
@@ -112,7 +249,9 @@ def test_unknown_top_level_field_is_rejected(tmp_path: Path) -> None:
 def test_provider_schema_rejects_plaintext_api_key() -> None:
     """Adding a plaintext api_key field must fail instead of widening the credential boundary."""
     with pytest.raises(ValidationError):
-        ProviderConfig(adapter="gemini", model="gemini-test", api_key="test-secret-never-persisted")
+        ProviderConfig(
+            adapter="gemini", model="gemini-test", api_key="test-secret-never-persisted"
+        )
 
 
 @pytest.mark.parametrize(
@@ -194,9 +333,7 @@ def test_load_rejects_invalid_provider_map_identifier_without_echo(
         pytest.param(
             {
                 "primary": "gemini",
-                "fallbacks": [
-                    {"provider": "private\nprovider", "authorized": True}
-                ],
+                "fallbacks": [{"provider": "private\nprovider", "authorized": True}],
             },
             "private\nprovider",
             id="fallback",

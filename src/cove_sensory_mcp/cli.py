@@ -18,7 +18,7 @@ from .config.paths import AppPaths
 from .config.schema import AppConfig, ProviderConfig
 from .config.secrets import KeyringSecretStore
 from .config.store import ConfigStore
-from .errors import SensoryError
+from .errors import ErrorCode, SensoryError
 from .models import Modality, ProviderId, ProviderRef, RouteConfig
 from .server import run_stdio
 from .services import AppServices
@@ -37,6 +37,7 @@ _MINIMAX_BASE_URLS = {
 }
 _PROVIDER_ID_ADAPTER = TypeAdapter(ProviderId)
 _CANCEL_VALUES = frozenset({"cancel", "quit", "q"})
+_CONFIG_CHANGED_MESSAGE = "The configuration changed before the update completed."
 
 
 class _ConfigurationCancelled(Exception):
@@ -202,35 +203,69 @@ def _write_verified_routes(
     selected_modalities: Sequence[Modality],
     input_fn: InputFn,
 ) -> None:
-    """Write primaries and only individually authorized cross-Provider fallbacks."""
-    latest = services.config_store.load()
-    primary = latest.providers[provider_id]
-    changed = False
+    """Collect authorizations, then merge routes in one short locked transaction."""
+    snapshot = services.config_store.load()
+    primary = snapshot.providers[provider_id]
+    original_primary = primary.model_copy(deep=True)
+    planned: dict[
+        Modality,
+        tuple[RouteConfig | None, dict[str, ProviderConfig], list[str]],
+    ] = {}
     for modality in selected_modalities:
         if not primary.verified_capabilities.get(modality, False):
             continue
-        fallbacks: list[ProviderRef] = []
-        for fallback_id, fallback in sorted(latest.providers.items()):
+        eligible: dict[str, ProviderConfig] = {}
+        authorized_ids: list[str] = []
+        for fallback_id, fallback in sorted(snapshot.providers.items()):
             if fallback_id == provider_id or not fallback.verified_capabilities.get(
                 modality,
                 False,
             ):
                 continue
+            eligible[fallback_id] = fallback.model_copy(deep=True)
             authorized = _optional_yes(
                 input_fn,
                 f"Authorize {fallback_id} as cross-Provider fallback for "
                 f"{modality.value}? [y/N]: ",
             )
             if authorized:
-                fallbacks.append(ProviderRef(provider=fallback_id, authorized=True))
-        setattr(
-            latest.routes,
-            modality.value,
-            RouteConfig(primary=provider_id, fallbacks=fallbacks),
+                authorized_ids.append(fallback_id)
+        planned[modality] = (
+            getattr(snapshot.routes, modality.value).model_copy(deep=True)
+            if getattr(snapshot.routes, modality.value) is not None
+            else None,
+            eligible,
+            authorized_ids,
         )
-        changed = True
-    if changed:
-        services.config_store.save(latest)
+    if not planned:
+        return
+
+    def merge_routes(latest: AppConfig) -> None:
+        current_primary = latest.providers.get(provider_id)
+        if current_primary != original_primary:
+            raise SensoryError(ErrorCode.CONFIG_INVALID, _CONFIG_CHANGED_MESSAGE)
+        for modality, (original_route, eligible, authorized_ids) in planned.items():
+            if getattr(latest.routes, modality.value) != original_route:
+                raise SensoryError(ErrorCode.CONFIG_INVALID, _CONFIG_CHANGED_MESSAGE)
+            if not current_primary.verified_capabilities.get(modality, False):
+                raise SensoryError(ErrorCode.CONFIG_INVALID, _CONFIG_CHANGED_MESSAGE)
+            fallbacks: list[ProviderRef] = []
+            for fallback_id in authorized_ids:
+                current_fallback = latest.providers.get(fallback_id)
+                if current_fallback != eligible[
+                    fallback_id
+                ] or not current_fallback.verified_capabilities.get(modality, False):
+                    raise SensoryError(
+                        ErrorCode.CONFIG_INVALID, _CONFIG_CHANGED_MESSAGE
+                    )
+                fallbacks.append(ProviderRef(provider=fallback_id, authorized=True))
+            setattr(
+                latest.routes,
+                modality.value,
+                RouteConfig(primary=provider_id, fallbacks=fallbacks),
+            )
+
+    services.config_store.update(merge_routes)
 
 
 def run_configure(
@@ -311,10 +346,20 @@ def run_configure(
             return 1
         stored_credential_ref = credential_ref
 
-    updated = config.model_copy(deep=True)
-    updated.providers[provider_id] = provider
     try:
-        services.config_store.save(updated)
+
+        def add_provider(latest: AppConfig) -> None:
+            if provider_id in latest.providers or (
+                credential_ref is not None
+                and any(
+                    configured.credential_ref == credential_ref
+                    for configured in latest.providers.values()
+                )
+            ):
+                raise SensoryError(ErrorCode.CONFIG_INVALID, _CONFIG_CHANGED_MESSAGE)
+            latest.providers[provider_id] = provider
+
+        services.config_store.update(add_provider)
     except (OSError, SensoryError):
         if stored_credential_ref is None:
             output("Configuration was not saved.")
@@ -376,7 +421,13 @@ def run_configure(
                     selected_modalities,
                     input_fn,
                 )
-            except (EOFError, KeyboardInterrupt, _ConfigurationCancelled, ValueError):
+            except (
+                EOFError,
+                KeyboardInterrupt,
+                SensoryError,
+                _ConfigurationCancelled,
+                ValueError,
+            ):
                 output(
                     "Fallback authorization stopped; no implicit fallback was added."
                 )

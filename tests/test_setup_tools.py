@@ -133,8 +133,10 @@ class StubVerifier:
 
     def __init__(self) -> None:
         self.modalities: list[Modality] | None = None
+        self.calls = 0
 
     async def verify(self, modalities: list[Modality]) -> dict[str, object]:
+        self.calls += 1
         self.modalities = modalities
         return {"status": "ok", "verified": [modality.value for modality in modalities]}
 
@@ -152,6 +154,37 @@ async def test_self_test_returns_the_injected_verifiers_public_result(
 
     assert result == {"status": "ok", "verified": ["video_visual"]}
     assert verifier.modalities == [Modality.VIDEO_VISUAL]
+
+
+@pytest.mark.parametrize(
+    "modalities",
+    [
+        [],
+        [Modality.IMAGE, Modality.IMAGE],
+        ["image"],
+        [{}],
+        None,
+    ],
+)
+@pytest.mark.asyncio
+async def test_self_test_rejects_empty_duplicate_and_non_enum_modalities_before_verifier(
+    services: AppServices,
+    modalities: object,
+) -> None:
+    verifier = StubVerifier()
+
+    result = await sensory_self_test(services, modalities, verifier=verifier)  # type: ignore[arg-type]
+
+    assert result == {
+        "status": "error",
+        "error": {
+            "code": "CONFIG_INVALID",
+            "message": "The self-test modalities are invalid.",
+            "retryable": False,
+        },
+    }
+    assert verifier.calls == 0
+    assert services.config_store.load() == AppConfig()
 
 
 class ReusedResultVerifier:
@@ -303,7 +336,8 @@ async def test_self_test_invokes_capability_verifier_and_returns_stable_public_r
                     MediaKind.IMAGE,
                     None,
                 )
-            }
+            },
+            trusted_root=tmp_path,
         ),
     )
 

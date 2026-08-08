@@ -5,20 +5,18 @@ that lets an Agent ask configured multimodal providers to inspect an explicitly 
 image, video, audio file, or music file. It is a sensory layer only: it does not provide
 chat, memory, personality, playback, continuous monitoring, or a calling policy.
 
-## Install and connect
+## Install and connect from source
 
-Python 3.11+ users can install with `uvx` or `pipx`. Standalone macOS (Apple Silicon and
-Intel) and Windows x64 archives are produced by release CI; the installers stay inside
-the current user account and never require administrator rights.
-
-The `0.1.0` release candidate is not public yet. Standalone archives must be treated as
-unsigned unless the downloaded draft's native CI evidence explicitly confirms signing
-(and, on macOS, notarization). The current local acceptance run does not substitute for
-the three native CI jobs or clean-account installation journeys.
+This repository is distributed as source code. It does not require a packaged desktop
+app or a standalone installer. Install [Git](https://git-scm.com/), Python 3.11+, and
+[uv](https://docs.astral.sh/uv/), then clone and set up the locked environment:
 
 ```console
-uvx cove-sensory-mcp doctor
-uvx cove-sensory-mcp print-config --client generic
+git clone https://github.com/moonlin1213/cove-sensory-mcp.git
+cd cove-sensory-mcp
+uv sync --locked
+uv run cove-sensory-mcp doctor
+uv run cove-sensory-mcp print-config --client generic
 ```
 
 Supported renderers are `generic`, `codex`, `claude-desktop`, and `claude-code`. Copy the
@@ -29,6 +27,10 @@ printed local stdio entry into your client, restart it, then ask the Agent to ca
 [Claude Code MCP](https://docs.anthropic.com/en/docs/claude-code/mcp).
 Client surfaces change independently; if a surface does not support local stdio MCP,
 run the server from a compatible host instead.
+
+Run later commands from the cloned repository with `uv run cove-sensory-mcp ...`.
+FFmpeg is optional for initial setup and image sensing, but video/audio preparation
+requires a working system FFmpeg discoverable on `PATH` or configured locally.
 
 Do not paste an API key into chat. Run `cove-sensory-mcp configure` in a local terminal:
 hidden input goes to the operating-system credential store, while `env:VARIABLE_NAME`

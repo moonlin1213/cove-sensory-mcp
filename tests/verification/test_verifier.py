@@ -440,6 +440,45 @@ async def test_unrelated_subjects_and_nonfinite_phrases_cannot_form_events(
 
 
 @pytest.mark.parametrize(
+    ("modality", "summary"),
+    [
+        (
+            Modality.VIDEO_VISUAL,
+            "A red ball moves and a car turns right.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell chimes and a light flashes twice.",
+        ),
+        (
+            Modality.AUDIO,
+            "A tone plays and a light flashes three times.",
+        ),
+        (
+            Modality.MUSIC,
+            "A piano plays and an arrow points upward.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_event_qualifiers_cannot_cross_coordinating_conjunctions(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    summary: str,
+) -> None:
+    store = _configured_store(tmp_path)
+
+    result = await _verifier(
+        store,
+        SemanticProvider({modality: summary}),
+        assets,
+    ).verify("vision", [modality])
+
+    assert result[0].verified is False
+
+
+@pytest.mark.parametrize(
     ("modality", "summary", "segment", "transcript"),
     [
         (

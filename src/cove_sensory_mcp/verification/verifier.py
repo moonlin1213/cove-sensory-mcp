@@ -76,7 +76,9 @@ _MUSIC_EVENT = frozenset(
 )
 _MUSIC_DIRECTION = frozenset({"ascending", "rising", "upward"})
 
-_SUBCLAUSE_BOUNDARY = re.compile(r";|\b(?:but|however|while|as|whereas)\b")
+_SUBCLAUSE_BOUNDARY = re.compile(
+    r";|\b(?:and|then|or|but|however|while|as|whereas)\b"
+)
 _TOKEN = re.compile(r"[a-z0-9]+(?:['’][a-z]+)?")
 _NEGATORS = frozenset({"no", "not", "never", "without", "cannot"})
 _CONTRACTIONS: dict[str, tuple[str, ...]] = {

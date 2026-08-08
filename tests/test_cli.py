@@ -14,6 +14,7 @@ from cove_sensory_mcp import __version__, cli
 from cove_sensory_mcp.cli import (
     main,
     run_configure,
+    run_configure_paths,
     run_doctor,
     run_self_test,
     run_status,
@@ -28,6 +29,20 @@ from cove_sensory_mcp.providers.base import MediaKind, PreparedMedia, ProviderRe
 from cove_sensory_mcp.services import AppServices
 from cove_sensory_mcp.tools.setup import _provider_adapter, verify_provider_capabilities
 from cove_sensory_mcp.verification.assets import SelfTestAssetStore
+
+
+def test_configure_paths_requires_explicit_exact_directory_approval(
+    tmp_services: AppServices, tmp_path: Path
+) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    answers = iter((str(media), "yes"))
+    messages: list[str] = []
+
+    assert run_configure_paths(tmp_services, lambda _: next(answers), messages.append) == 0
+
+    assert tmp_services.config_store.load().allowed_media_roots == [str(media.resolve())]
+    assert any(str(media.resolve()) in message for message in messages)
 
 
 class _StaticAsyncStream(httpx.AsyncByteStream):

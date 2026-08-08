@@ -472,6 +472,38 @@ def run_configure(
     return 0
 
 
+def run_configure_paths(
+    services: AppServices,
+    input_fn: InputFn,
+    output: OutputFn,
+) -> int:
+    """Add one exact existing media directory after explicit local approval."""
+    try:
+        raw = _clean_answer(input_fn, "Media directory to authorize: ")
+        candidate = Path(raw).expanduser().resolve(strict=True)
+        if not candidate.is_dir() or candidate.parent == candidate:
+            raise ValueError("invalid root")
+        output(f"Directory to authorize: {candidate}")
+        if not _optional_yes(input_fn, "Authorize this exact directory? [y/N]: "):
+            output("Media directory authorization cancelled; nothing was saved.")
+            return 1
+
+        def add_root(config: AppConfig) -> None:
+            canonical_existing = {
+                str(Path(root).expanduser().resolve(strict=True))
+                for root in config.allowed_media_roots
+            }
+            if str(candidate) not in canonical_existing:
+                config.allowed_media_roots.append(str(candidate))
+
+        services.config_store.update(add_root)
+    except (OSError, SensoryError, ValueError, _ConfigurationCancelled):
+        output("Media directory was not saved.")
+        return 1
+    output("Media directory authorized.")
+    return 0
+
+
 def _credential_available(
     services: AppServices, provider_id: str, provider: ProviderConfig
 ) -> bool:
@@ -603,7 +635,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--version", action="store_true")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("serve", help="Run the local MCP server over stdio.")
-    subparsers.add_parser("configure", help="Configure one provider locally.")
+    configure_parser = subparsers.add_parser(
+        "configure", help="Configure a provider or media paths locally."
+    )
+    configure_parser.add_argument(
+        "target", nargs="?", choices=("provider", "paths"), default="provider"
+    )
     subparsers.add_parser("status", help="Show redacted local setup status.")
     subparsers.add_parser("doctor", help="Run local-only setup diagnostics.")
     self_test_parser = subparsers.add_parser(
@@ -623,6 +660,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_stdio(_build_services())
         return 0
     if args.command == "configure":
+        if args.target == "paths":
+            return run_configure_paths(_build_services(), input_fn=input, output=print)
         return run_configure(
             _build_services(),
             input_fn=input,

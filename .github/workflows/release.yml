@@ -1,0 +1,97 @@
+name: Draft release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            tag: macos-arm64
+          - os: macos-13
+            tag: macos-x64
+          - os: windows-latest
+            tag: windows-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc
+        with:
+          version: "0.8.14"
+          enable-cache: false
+      - run: uv sync --locked --group dev
+      - run: uv run pytest -q
+      - run: uv run pyinstaller --clean packaging/cove_sensory_mcp.spec
+      - run: uv run python scripts/generate_sbom.py --output dist/cove-sensory-mcp/SBOM.spdx.json
+      - name: Optional macOS signing (publication remains draft)
+        if: startsWith(matrix.tag, 'macos-') && env.MACOS_CERTIFICATE != ''
+        shell: bash
+        run: |
+          security create-keychain -p temporary build.keychain
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          codesign --force --deep --options runtime --sign "$MACOS_SIGNING_IDENTITY" dist/cove-sensory-mcp/cove-sensory-mcp
+          codesign --verify --deep --strict dist/cove-sensory-mcp/cove-sensory-mcp
+      - name: Optional Windows signing (publication remains draft)
+        if: matrix.tag == 'windows-x64' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("certificate.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          signtool sign /fd SHA256 /f certificate.pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD dist/cove-sensory-mcp/cove-sensory-mcp.exe
+          signtool verify /pa dist/cove-sensory-mcp/cove-sensory-mcp.exe
+      - run: uv run python scripts/build_release.py --platform-tag ${{ matrix.tag }} --output dist/release
+      - run: uv run python scripts/verify_release.py ${{ startsWith(matrix.tag, 'windows-') && format('dist/release/cove-sensory-mcp-0.1.0-{0}.zip', matrix.tag) || format('dist/release/cove-sensory-mcp-0.1.0-{0}.tar.gz', matrix.tag) }} --platform-tag ${{ matrix.tag }}
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: standalone-${{ matrix.tag }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  python-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc
+        with:
+          version: "0.8.14"
+          enable-cache: false
+      - run: uv sync --locked --group dev
+      - run: uv build
+      - run: uv run python scripts/generate_sbom.py --output dist/SBOM.spdx.json
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: python-packages
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SBOM.spdx.json
+
+  draft-release:
+    needs: [standalone, python-packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Combine checksums
+        run: find artifacts -type f ! -name '*.sha256' -print0 | sort -z | xargs -0 sha256sum > artifacts/SHA256SUMS.txt
+      - name: Create draft only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --draft --title "Cove Sensory MCP $GITHUB_REF_NAME" --notes "Draft artifacts. Signing and notarization status must be reviewed before publication." artifacts/*

@@ -1,0 +1,37 @@
+name: Protected live Provider smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    environment: live-provider-smoke
+    runs-on: ubuntu-latest
+    env:
+      COVE_GEMINI_KEY: ${{ secrets.COVE_GEMINI_KEY }}
+      COVE_MINIMAX_KEY: ${{ secrets.COVE_MINIMAX_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc
+        with:
+          version: "0.8.14"
+          enable-cache: false
+      - run: uv sync --locked --group dev
+      - name: Run quota-bearing self-test without retaining Provider output
+        shell: bash
+        run: |
+          set +e
+          uv run cove-sensory-mcp self-test --yes >/dev/null 2>/dev/null
+          result=$?
+          printf '{"schema":1,"passed":%s}\n' "$([ "$result" -eq 0 ] && printf true || printf false)" > live-smoke-summary.json
+          exit "$result"
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        if: always()
+        with:
+          name: redacted-live-smoke-summary
+          path: live-smoke-summary.json
+          retention-days: 7
+

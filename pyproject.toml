@@ -45,5 +45,14 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/cove_sensory_mcp"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/README.md",
+  "/LICENSE",
+  "/NOTICE",
+  "/THIRD_PARTY_NOTICES.md",
+]
+
 [tool.ruff]
 target-version = "py311"

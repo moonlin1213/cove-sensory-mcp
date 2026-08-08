@@ -20,7 +20,11 @@ from cove_sensory_mcp.providers.base import (
     ProviderRequest,
 )
 from cove_sensory_mcp.providers.registry import ProviderRegistry
-from cove_sensory_mcp.reports.schemas import ObservationEnvelope
+from cove_sensory_mcp.reports.schemas import (
+    ObservationEnvelope,
+    ObservationSegment,
+    TranscriptSegment,
+)
 from cove_sensory_mcp.verification.assets import SelfTestAssetStore
 from cove_sensory_mcp.verification.verifier import CapabilityVerifier
 
@@ -75,7 +79,7 @@ class SemanticProvider:
 
     def __init__(
         self,
-        summaries: dict[Modality, str | BaseException],
+        summaries: dict[Modality, str | ObservationEnvelope | BaseException],
         *,
         before_return: Callable[[ProviderRequest], None] | None = None,
         returned_model: str = "test-model",
@@ -93,8 +97,12 @@ class SemanticProvider:
         outcome = self._summaries[modality]
         if isinstance(outcome, BaseException):
             raise outcome
+        if isinstance(outcome, ObservationEnvelope):
+            observation = outcome
+        else:
+            observation = _observation(modality, outcome)
         return ProviderCallResult(
-            observations={modality: _observation(modality, outcome)},
+            observations={modality: observation},
             provider_id="vision",
             model=self._returned_model,
             remote_file_deleted=None,
@@ -381,6 +389,129 @@ async def test_each_modality_preserves_its_complete_affirmative_fixture_event(
     ).verify("vision", [modality])
 
     assert result[0].verified is True
+
+
+@pytest.mark.parametrize(
+    ("modality", "summary"),
+    [
+        (Modality.IMAGE, "A red triangle and a blue circle are visible."),
+        (
+            Modality.VIDEO_VISUAL,
+            "A red square and a blue ball are moving right.",
+        ),
+        (
+            Modality.VIDEO_VISUAL,
+            "A red car is beside a blue ball; it moves right.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell sounds as two lights flash.",
+        ),
+        (Modality.AUDIO, "Three beeps."),
+        (
+            Modality.AUDIO,
+            "Three bells ring while a tone plays once.",
+        ),
+        (Modality.MUSIC, "A piano playing ascending."),
+        (
+            Modality.MUSIC,
+            "A piano plays while an ascending graph is visible.",
+        ),
+        (Modality.VIDEO_VISUAL, "A red ball moving right."),
+        (Modality.IMAGE, "Visible: blue triangle."),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unrelated_subjects_and_nonfinite_phrases_cannot_form_events(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    summary: str,
+) -> None:
+    store = _configured_store(tmp_path)
+
+    result = await _verifier(
+        store,
+        SemanticProvider({modality: summary}),
+        assets,
+    ).verify("vision", [modality])
+
+    assert result[0].verified is False
+
+
+@pytest.mark.parametrize(
+    ("modality", "summary", "segment", "transcript"),
+    [
+        (
+            Modality.IMAGE,
+            "A blue object is visible.",
+            "A triangle is present.",
+            "The color is blue.",
+        ),
+        (
+            Modality.VIDEO_VISUAL,
+            "A red ball is visible.",
+            "An object moves.",
+            "The direction is right.",
+        ),
+        (
+            Modality.VIDEO_AUDIO,
+            "A bell is visible.",
+            "Something chimes.",
+            "The count is twice.",
+        ),
+        (
+            Modality.AUDIO,
+            "A tone is present.",
+            "Something beeps.",
+            "The count is three.",
+        ),
+        (
+            Modality.MUSIC,
+            "A piano is present.",
+            "Something plays.",
+            "The contour is ascending.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_summary_segments_and_transcript_cannot_assemble_one_event(
+    tmp_path: Path,
+    assets: SelfTestAssetStore,
+    modality: Modality,
+    summary: str,
+    segment: str,
+    transcript: str,
+) -> None:
+    store = _configured_store(tmp_path)
+    envelope = ObservationEnvelope(
+        modality=modality,
+        summary=summary,
+        segments=[
+            ObservationSegment(
+                start_seconds=0.0,
+                end_seconds=1.0,
+                text=segment,
+            )
+        ],
+        transcript=[
+            TranscriptSegment(
+                start_seconds=0.0,
+                end_seconds=1.0,
+                text=transcript,
+            )
+        ],
+        warnings=[],
+        confidence="high",
+    )
+
+    result = await _verifier(
+        store,
+        SemanticProvider({modality: envelope}),
+        assets,
+    ).verify("vision", [modality])
+
+    assert result[0].verified is False
 
 
 @pytest.mark.asyncio

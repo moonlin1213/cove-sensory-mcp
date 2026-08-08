@@ -42,51 +42,41 @@ _BATCH_ABORT_CODES = frozenset(
 
 _IMAGE_COLOR = frozenset({"blue", "azure"})
 _IMAGE_OBJECT = frozenset({"triangle", "triangular"})
-_IMAGE_EVENT = frozenset(
-    {
-        "appear",
-        "appears",
-        "centered",
-        "contains",
-        "displays",
-        "shown",
-        "shows",
-        "visible",
-    }
-)
+_IMAGE_SUBJECT_PREDICATE = frozenset({"visible", "centered", "shown"})
+_IMAGE_ACTIVE_PREDICATE = frozenset({"appears"})
+_IMAGE_CONTAINER_PREDICATE = frozenset({"contains", "displays", "shows"})
 _VIDEO_COLOR = frozenset({"red", "crimson"})
 _VIDEO_OBJECT = frozenset({"ball", "sphere", "circle"})
-_VIDEO_EVENT = frozenset(
+_VIDEO_FINITE_EVENT = frozenset(
     {
-        "move",
         "moves",
-        "moving",
-        "travel",
+        "moved",
         "travels",
-        "traveling",
-        "travelling",
-        "roll",
+        "traveled",
+        "travelled",
         "rolls",
-        "rolling",
-        "cross",
+        "rolled",
         "crosses",
-        "crossing",
+        "crossed",
     }
+)
+_VIDEO_PARTICIPLE_EVENT = frozenset(
+    {"moving", "traveling", "travelling", "rolling", "crossing"}
 )
 _VIDEO_DIRECTION = frozenset({"right", "rightward"})
 _BELL_OBJECT = frozenset({"bell"})
-_BELL_EVENT = frozenset({"chimes", "chimed", "rings", "rang", "sounds"})
-_BELL_COUNT = frozenset({"twice", "two", "second"})
+_BELL_EVENT = frozenset(
+    {"chimes", "chimed", "rings", "rang", "sounds", "sounded"}
+)
 _AUDIO_OBJECT = frozenset({"beep", "beeps", "tone", "tones"})
-_AUDIO_EVENT = frozenset({"beeps", "beeping", "sounds", "plays", "played"})
-_AUDIO_COUNT = frozenset({"three", "triple"})
+_AUDIO_EVENT = frozenset({"beeps", "beeped", "sounds", "sounded", "plays", "played"})
 _MUSIC_OBJECT = frozenset({"piano", "keyboard"})
 _MUSIC_EVENT = frozenset(
-    {"plays", "played", "playing", "rises", "rose", "ascends", "ascended"}
+    {"plays", "played", "rises", "rose", "ascends", "ascended"}
 )
 _MUSIC_DIRECTION = frozenset({"ascending", "rising", "upward"})
 
-_SUBCLAUSE_BOUNDARY = re.compile(r";|\b(?:but|however)\b")
+_SUBCLAUSE_BOUNDARY = re.compile(r";|\b(?:but|however|while|as|whereas)\b")
 _TOKEN = re.compile(r"[a-z0-9]+(?:['’][a-z]+)?")
 _NEGATORS = frozenset({"no", "not", "never", "without", "cannot"})
 _CONTRACTIONS: dict[str, tuple[str, ...]] = {
@@ -189,18 +179,6 @@ def _positive_occurrence(tokens: tuple[str, ...], index: int) -> bool:
     return True
 
 
-def _positive_indices(
-    tokens: tuple[str, ...],
-    terms: frozenset[str],
-) -> tuple[int, ...]:
-    cutoff = _contrast_cutoff(tokens)
-    return tuple(
-        index
-        for index, token in enumerate(tokens)
-        if index < cutoff and token in terms and _positive_occurrence(tokens, index)
-    )
-
-
 def _contrast_cutoff(tokens: tuple[str, ...]) -> int:
     cutoffs = [
         index
@@ -208,10 +186,6 @@ def _contrast_cutoff(tokens: tuple[str, ...]) -> int:
         if (tokens[index], tokens[index + 1]) in _CONTRASTS
     ]
     return min(cutoffs, default=len(tokens))
-
-
-def _bounded(*indices: int, limit: int = _MAX_EVENT_SPAN) -> bool:
-    return max(indices) - min(indices) <= limit
 
 
 def _contains_sequence(tokens: tuple[str, ...], expected: tuple[str, ...]) -> bool:
@@ -239,17 +213,85 @@ def _sentence_denies_after(
     return any(_contains_sequence(bounded_tail, denial) for denial in _POST_DENIALS)
 
 
-def _image_candidate_ends(tokens: tuple[str, ...]) -> tuple[int, ...]:
-    colors = _positive_indices(tokens, _IMAGE_COLOR)
-    objects = _positive_indices(tokens, _IMAGE_OBJECT)
-    events = _positive_indices(tokens, _IMAGE_EVENT)
-    return tuple(
-        max(color, object_index, event)
-        for color in colors
-        for object_index in objects
-        for event in events
-        if _bounded(color, object_index, event)
+def _positive_term(
+    tokens: tuple[str, ...],
+    index: int,
+    terms: frozenset[str],
+    cutoff: int,
+) -> bool:
+    return (
+        0 <= index < cutoff
+        and tokens[index] in terms
+        and _positive_occurrence(tokens, index)
     )
+
+
+def _positive_sequence(
+    tokens: tuple[str, ...],
+    index: int,
+    expected: tuple[str, ...],
+    cutoff: int,
+) -> bool:
+    return (
+        index >= 0
+        and index + len(expected) <= cutoff
+        and tokens[index : index + len(expected)] == expected
+        and all(
+            _positive_occurrence(tokens, position)
+            for position in range(index, index + len(expected))
+        )
+    )
+
+
+def _subject_spans(
+    tokens: tuple[str, ...],
+    *,
+    descriptors: frozenset[str],
+    objects: frozenset[str],
+    max_descriptor_object_gap: int,
+) -> tuple[tuple[int, int], ...]:
+    """Find bounded descriptor+noun subjects, never independent keyword products."""
+    cutoff = _contrast_cutoff(tokens)
+    spans: list[tuple[int, int]] = []
+    for descriptor in range(cutoff):
+        if not _positive_term(tokens, descriptor, descriptors, cutoff):
+            continue
+        stop = min(cutoff, descriptor + max_descriptor_object_gap + 2)
+        for object_index in range(descriptor + 1, stop):
+            if _positive_term(tokens, object_index, objects, cutoff):
+                spans.append((descriptor, object_index))
+                break
+    return tuple(spans)
+
+
+def _image_candidate_ends(tokens: tuple[str, ...]) -> tuple[int, ...]:
+    cutoff = _contrast_cutoff(tokens)
+    subjects = _subject_spans(
+        tokens,
+        descriptors=_IMAGE_COLOR,
+        objects=_IMAGE_OBJECT,
+        max_descriptor_object_gap=0,
+    )
+    candidates: list[int] = []
+    auxiliaries = frozenset({"is", "was", "are", "were"})
+    for subject_start, subject_end in subjects:
+        # Subject-led finite predicates: "blue triangle is visible" or "appears".
+        active_stop = min(cutoff, subject_end + 4)
+        for event in range(subject_end + 1, active_stop):
+            if _positive_term(tokens, event, _IMAGE_ACTIVE_PREDICATE, cutoff):
+                candidates.append(event)
+            if not _positive_term(tokens, event, auxiliaries, cutoff):
+                continue
+            predicate = event + 1
+            if _positive_term(tokens, predicate, _IMAGE_SUBJECT_PREDICATE, cutoff):
+                candidates.append(predicate)
+
+        # Container-led finite predicates: "the image contains a blue triangle".
+        prefix_start = max(0, subject_start - 6)
+        for event in range(prefix_start, subject_start):
+            if _positive_term(tokens, event, _IMAGE_CONTAINER_PREDICATE, cutoff):
+                candidates.append(subject_end)
+    return tuple(candidates)
 
 
 def _video_candidate_ends(
@@ -257,68 +299,139 @@ def _video_candidate_ends(
     clause_index: int,
 ) -> tuple[int, ...]:
     tokens = clauses[clause_index]
-    colors = _positive_indices(tokens, _VIDEO_COLOR)
-    objects = _positive_indices(tokens, _VIDEO_OBJECT)
-    events = _positive_indices(tokens, _VIDEO_EVENT)
-    directions = _positive_indices(tokens, _VIDEO_DIRECTION)
-
-    def has_same_subject(event: int) -> bool:
-        return any(color < event for color in colors) and any(
-            object_index < event for object_index in objects
-        )
+    cutoff = _contrast_cutoff(tokens)
+    subjects = _subject_spans(
+        tokens,
+        descriptors=_VIDEO_COLOR,
+        objects=_VIDEO_OBJECT,
+        max_descriptor_object_gap=1,
+    )
 
     previous_subject = False
     if clause_index > 0:
         previous = clauses[clause_index - 1]
-        previous_colors = _positive_indices(previous, _VIDEO_COLOR)
-        previous_objects = _positive_indices(previous, _VIDEO_OBJECT)
-        previous_end = (
-            max(previous_colors + previous_objects)
-            if previous_colors and previous_objects
-            else 0
+        previous_spans = _subject_spans(
+            previous,
+            descriptors=_VIDEO_COLOR,
+            objects=_VIDEO_OBJECT,
+            max_descriptor_object_gap=1,
         )
-        previous_subject = bool(
-            previous_colors
-            and previous_objects
-            and "it" in tokens
-            and not _sentence_denies_after(
-                clauses,
-                clause_index - 1,
-                previous_end,
-            )
+        previous_subject = any(
+            not _sentence_denies_after(clauses, clause_index - 1, subject_end)
+            for _, subject_end in previous_spans
         )
-    return tuple(
-        direction
-        for event in events
-        for direction in directions
-        if event < direction <= event + 8
-        and (has_same_subject(event) or previous_subject)
-    )
+
+    def finite_event(index: int) -> bool:
+        if _positive_term(tokens, index, _VIDEO_FINITE_EVENT, cutoff):
+            return True
+        if not _positive_term(tokens, index, _VIDEO_PARTICIPLE_EVENT, cutoff):
+            return False
+        return index > 0 and tokens[index - 1] in {"is", "was", "are", "were"}
+
+    subject_ends = [subject_end for _, subject_end in subjects]
+    if previous_subject:
+        pronouns = [
+            index
+            for index, token in enumerate(tokens[:cutoff])
+            if token == "it" and _positive_occurrence(tokens, index)
+        ]
+        subject_ends.extend(pronouns)
+
+    candidates: list[int] = []
+    for subject_end in subject_ends:
+        event_stop = min(cutoff, subject_end + 9)
+        for event in range(subject_end + 1, event_stop):
+            if not finite_event(event):
+                continue
+            direction_stop = min(cutoff, event + 9)
+            for direction in range(event + 1, direction_stop):
+                if _positive_term(tokens, direction, _VIDEO_DIRECTION, cutoff):
+                    candidates.append(direction)
+    return tuple(candidates)
 
 
-def _event_candidate_ends(
+def _hearing_candidate_ends(
     tokens: tuple[str, ...],
     *,
     objects: frozenset[str],
     events: frozenset[str],
-    qualifiers: frozenset[str],
-    object_must_precede: bool,
-    qualifier_must_follow: bool,
+    count: tuple[str, ...],
 ) -> tuple[int, ...]:
-    object_indices = _positive_indices(tokens, objects)
-    event_indices = _positive_indices(tokens, events)
-    qualifier_indices = _positive_indices(tokens, qualifiers)
-    return tuple(
-        max(object_index, event, qualifier)
-        for object_index in object_indices
-        for event in event_indices
-        for qualifier in qualifier_indices
-        if (not object_must_precede or object_index <= event)
-        and (not qualifier_must_follow or event < qualifier)
-        and abs(object_index - event) <= 6
-        and abs(qualifier - event) <= 6
-        and _bounded(object_index, event, qualifier, limit=10)
+    """Bind an audible subject, finite event, and exact count in order."""
+    cutoff = _contrast_cutoff(tokens)
+    candidates: list[int] = []
+    for subject in range(cutoff):
+        if not _positive_term(tokens, subject, objects, cutoff):
+            continue
+        event_stop = min(cutoff, subject + 7)
+        for event in range(subject + 1, event_stop):
+            if not _positive_term(tokens, event, events, cutoff):
+                continue
+            count_stop = min(cutoff, event + 7)
+            for count_start in range(event + 1, count_stop):
+                if _positive_sequence(tokens, count_start, count, cutoff):
+                    candidates.append(count_start + len(count) - 1)
+    return tuple(candidates)
+
+
+def _video_audio_candidate_ends(tokens: tuple[str, ...]) -> tuple[int, ...]:
+    exact_twice = _hearing_candidate_ends(
+        tokens,
+        objects=_BELL_OBJECT,
+        events=_BELL_EVENT,
+        count=("twice",),
     )
+    two_times = _hearing_candidate_ends(
+        tokens,
+        objects=_BELL_OBJECT,
+        events=_BELL_EVENT,
+        count=("two", "times"),
+    )
+    return exact_twice + two_times
+
+
+def _audio_candidate_ends(tokens: tuple[str, ...]) -> tuple[int, ...]:
+    candidates = list(
+        _hearing_candidate_ends(
+            tokens,
+            objects=_AUDIO_OBJECT,
+            events=_AUDIO_EVENT,
+            count=("three", "times"),
+        )
+    )
+    cutoff = _contrast_cutoff(tokens)
+    # Natural count-led finite construction, never the noun fragment "Three beeps.".
+    for count_start in range(max(0, cutoff - 5)):
+        if not _positive_sequence(tokens, count_start, ("three", "beeps"), cutoff):
+            continue
+        auxiliary = count_start + 2
+        predicate = auxiliary + 1
+        if (
+            auxiliary < cutoff
+            and tokens[auxiliary] in {"are", "were"}
+            and predicate < cutoff
+            and tokens[predicate] in {"heard", "sounded"}
+            and _positive_occurrence(tokens, predicate)
+        ):
+            candidates.append(predicate)
+    return tuple(candidates)
+
+
+def _music_candidate_ends(tokens: tuple[str, ...]) -> tuple[int, ...]:
+    cutoff = _contrast_cutoff(tokens)
+    candidates: list[int] = []
+    for subject in range(cutoff):
+        if not _positive_term(tokens, subject, _MUSIC_OBJECT, cutoff):
+            continue
+        event_stop = min(cutoff, subject + 7)
+        for event in range(subject + 1, event_stop):
+            if not _positive_term(tokens, event, _MUSIC_EVENT, cutoff):
+                continue
+            direction_stop = min(cutoff, event + 7)
+            for direction in range(event + 1, direction_stop):
+                if _positive_term(tokens, direction, _MUSIC_DIRECTION, cutoff):
+                    candidates.append(direction)
+    return tuple(candidates)
 
 
 def _candidate_ends(
@@ -332,31 +445,10 @@ def _candidate_ends(
     if modality is Modality.VIDEO_VISUAL:
         return _video_candidate_ends(clauses, clause_index)
     if modality is Modality.VIDEO_AUDIO:
-        return _event_candidate_ends(
-            tokens,
-            objects=_BELL_OBJECT,
-            events=_BELL_EVENT,
-            qualifiers=_BELL_COUNT,
-            object_must_precede=True,
-            qualifier_must_follow=True,
-        )
+        return _video_audio_candidate_ends(tokens)
     if modality is Modality.AUDIO:
-        return _event_candidate_ends(
-            tokens,
-            objects=_AUDIO_OBJECT,
-            events=_AUDIO_EVENT,
-            qualifiers=_AUDIO_COUNT,
-            object_must_precede=False,
-            qualifier_must_follow=False,
-        )
-    return _event_candidate_ends(
-        tokens,
-        objects=_MUSIC_OBJECT,
-        events=_MUSIC_EVENT,
-        qualifiers=_MUSIC_DIRECTION,
-        object_must_precede=True,
-        qualifier_must_follow=True,
-    )
+        return _audio_candidate_ends(tokens)
+    return _music_candidate_ends(tokens)
 
 
 def _matches_expected_facts(

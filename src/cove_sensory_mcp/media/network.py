@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
@@ -21,7 +22,7 @@ DnsResolver = Callable[[str], Iterable[str]]
 
 
 def _system_resolve(host: str) -> Iterable[str]:
-    return {item[4][0] for item in socket.getaddrinfo(host, None)}
+    return {cast(str, item[4][0]) for item in socket.getaddrinfo(host, None)}
 
 
 def _blocked(message: str = "The media URL was blocked by the network policy.") -> SensoryError:

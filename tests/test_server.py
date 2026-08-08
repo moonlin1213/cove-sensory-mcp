@@ -26,14 +26,22 @@ def services(tmp_path) -> AppServices:
 
 
 @pytest.mark.asyncio
-async def test_foundation_server_lists_exact_setup_tools(services: AppServices) -> None:
-    """Adding, omitting, or renaming a foundation tool changes the public MCP surface."""
+async def test_server_lists_exact_public_tools(services: AppServices) -> None:
+    """Adding, omitting, or renaming a tool changes the approved public MCP surface."""
     server = create_server(services)
 
     names = sorted(tool.name for tool in await server.list_tools())
 
     assert server.name == "cove-sensory-mcp"
-    assert names == ["sensory_self_test", "sensory_setup_guide", "sensory_status"]
+    assert names == [
+        "sense_audio",
+        "sense_image",
+        "sense_music",
+        "sense_video",
+        "sensory_self_test",
+        "sensory_setup_guide",
+        "sensory_status",
+    ]
 
 
 @pytest.mark.asyncio
@@ -43,7 +51,9 @@ async def test_setup_tools_advertise_local_read_only_safety(
     """Unsafe descriptions or mutation hints could invite credential-bearing calls."""
     tools = await create_server(services).list_tools()
 
-    safe_tools = [tool for tool in tools if tool.name != "sensory_self_test"]
+    safe_tools = [
+        tool for tool in tools if tool.name in {"sensory_status", "sensory_setup_guide"}
+    ]
     for tool in safe_tools:
         assert "inspect local configuration" in tool.description.lower()
         assert "never accept credentials" in tool.description.lower()

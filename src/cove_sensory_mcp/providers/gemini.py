@@ -310,7 +310,7 @@ class _OfficialGoogleGenAIClient:
         try:
             response = await self._client.aio.models.generate_content(
                 model=model,
-                contents=[self._types.Content(role="user", parts=parts)],
+                contents=[self._types.Content(role="user", parts=parts)],  # type: ignore[arg-type]
                 config=config,
             )
             safety_rejected = _is_safety_rejection(response)

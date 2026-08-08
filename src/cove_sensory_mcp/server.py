@@ -14,13 +14,23 @@ from mcp.types import CallToolResult, InputRequiredResult, TextContent, ToolAnno
 from pydantic import AfterValidator, Field
 
 from cove_sensory_mcp.errors import ErrorCode, SensoryError, error_result
-from cove_sensory_mcp.models import Modality
+from cove_sensory_mcp.models import DetailLevel, Modality, ProviderId
 from cove_sensory_mcp.services import AppServices
+from cove_sensory_mcp.tools.audio import sense_audio
+from cove_sensory_mcp.tools.image import sense_image
+from cove_sensory_mcp.tools.inputs import (
+    SenseAudioInput,
+    SenseImageInput,
+    SenseMusicInput,
+    SenseVideoInput,
+)
+from cove_sensory_mcp.tools.music import sense_music
 from cove_sensory_mcp.tools.setup import (
     sensory_self_test,
     sensory_setup_guide,
     sensory_status,
 )
+from cove_sensory_mcp.tools.video import sense_video
 
 RequestedModality = Literal["image", "video_visual", "video_audio", "audio", "music"]
 
@@ -54,6 +64,16 @@ _SELF_TEST_ANNOTATIONS = ToolAnnotations(
     destructive_hint=True,
     idempotent_hint=False,
     open_world_hint=True,
+)
+_SENSING_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=True,
+)
+_SENSING_DESCRIPTION = (
+    "Read caller-authorized media and send it to the user's configured sensory Provider; "
+    "the original media is never modified or stored permanently."
 )
 _STATUS_DESCRIPTION = "Inspect local configuration status; read-only setup tools never accept credentials."
 _GUIDE_DESCRIPTION = "Inspect local configuration setup options; read-only setup tools never accept credentials."
@@ -123,6 +143,114 @@ def create_server(services: AppServices) -> FastMCP[None]:
     async def self_test_tool(modalities: RequestedModalities) -> dict[str, object]:
         return await sensory_self_test(
             services, [Modality(modality) for modality in modalities]
+        )
+
+    @server.tool(
+        name="sense_image",
+        description=_SENSING_DESCRIPTION,
+        annotations=_SENSING_ANNOTATIONS,
+    )
+    async def image_tool(
+        source: str,
+        question: str = "",
+        detail: DetailLevel = DetailLevel.AUTO,
+        language: str = "zh-CN",
+        provider: ProviderId | None = None,
+    ) -> CallToolResult:
+        return await sense_image(
+            services,
+            SenseImageInput(
+                source=source,
+                question=question,
+                detail=detail,
+                language=language,
+                provider=provider,
+            ),
+        )
+
+    @server.tool(
+        name="sense_video",
+        description=_SENSING_DESCRIPTION,
+        annotations=_SENSING_ANNOTATIONS,
+    )
+    async def video_tool(
+        source: str,
+        question: str = "",
+        start_seconds: float | None = None,
+        end_seconds: float | None = None,
+        detail: DetailLevel = DetailLevel.AUTO,
+        include_audio: bool = True,
+        language: str = "zh-CN",
+        visual_provider: ProviderId | None = None,
+        audio_provider: ProviderId | None = None,
+    ) -> CallToolResult:
+        return await sense_video(
+            services,
+            SenseVideoInput(
+                source=source,
+                question=question,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                detail=detail,
+                include_audio=include_audio,
+                language=language,
+                visual_provider=visual_provider,
+                audio_provider=audio_provider,
+            ),
+        )
+
+    @server.tool(
+        name="sense_audio",
+        description=_SENSING_DESCRIPTION,
+        annotations=_SENSING_ANNOTATIONS,
+    )
+    async def audio_tool(
+        source: str,
+        question: str = "",
+        start_seconds: float | None = None,
+        end_seconds: float | None = None,
+        detail: DetailLevel = DetailLevel.AUTO,
+        include_transcript: bool = True,
+        language: str = "zh-CN",
+    ) -> CallToolResult:
+        return await sense_audio(
+            services,
+            SenseAudioInput(
+                source=source,
+                question=question,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                detail=detail,
+                include_transcript=include_transcript,
+                language=language,
+            ),
+        )
+
+    @server.tool(
+        name="sense_music",
+        description=_SENSING_DESCRIPTION,
+        annotations=_SENSING_ANNOTATIONS,
+    )
+    async def music_tool(
+        source: str,
+        question: str = "",
+        start_seconds: float | None = None,
+        end_seconds: float | None = None,
+        detail: DetailLevel = DetailLevel.AUTO,
+        include_lyrics_transcript: bool = False,
+        language: str = "zh-CN",
+    ) -> CallToolResult:
+        return await sense_music(
+            services,
+            SenseMusicInput(
+                source=source,
+                question=question,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                detail=detail,
+                include_lyrics_transcript=include_lyrics_transcript,
+                language=language,
+            ),
         )
 
     return server

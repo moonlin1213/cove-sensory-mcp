@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -13,7 +14,7 @@ from .types import ResolvedSource
 class SourceResolver:
     def __init__(
         self,
-        allowed_roots: list[str | Path],
+        allowed_roots: Sequence[str | Path],
         *,
         downloader: MediaDownloader | None = None,
         network_limits: NetworkLimits | None = None,

@@ -233,10 +233,14 @@ class _OfficialGoogleGenAIClient:
     async def upload_file(self, *, path: Path, mime_type: str) -> GeminiRemoteFile:
         try:
             config = self._types.UploadFileConfig(mime_type=mime_type)
-            uploaded = await self._client.aio.files.upload(
-                file=path,
-                config=config,
-            )
+            # A path makes google-genai copy its basename into an ASCII-only
+            # upload header. A binary stream omits that header and supports
+            # every local filename without duplicating private media.
+            with path.open("rb") as media_stream:
+                uploaded = await self._client.aio.files.upload(
+                    file=media_stream,
+                    config=config,
+                )
             name = getattr(uploaded, "name", None)
             uri = getattr(uploaded, "uri", None)
             uploaded_mime = getattr(uploaded, "mime_type", None)

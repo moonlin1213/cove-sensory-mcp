@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import secrets
@@ -840,11 +841,14 @@ class _SyncFilesForbidden:
 class _AsyncFilesSpy:
     def __init__(self) -> None:
         self.upload_calls: list[dict[str, object]] = []
+        self.upload_stream_bytes: list[bytes] = []
+        self.upload_stream_open_during_call: list[bool] = []
         self.get_calls: list[dict[str, object]] = []
         self.delete_calls: list[dict[str, object]] = []
         self.upload_started = asyncio.Event()
         self.upload_gate: asyncio.Event | None = None
         self.upload_cancelled = False
+        self.upload_error: Exception | None = None
         self.get_responses: list[object] = [
             SimpleNamespace(
                 name="files/official-upload",
@@ -856,6 +860,12 @@ class _AsyncFilesSpy:
 
     async def upload(self, **kwargs: object) -> object:
         self.upload_calls.append(kwargs)
+        file = kwargs.get("file")
+        if isinstance(file, io.IOBase):
+            self.upload_stream_open_during_call.append(not file.closed)
+            offset = file.tell()
+            self.upload_stream_bytes.append(file.read())
+            file.seek(offset)
         self.upload_started.set()
         try:
             if self.upload_gate is not None:
@@ -863,6 +873,8 @@ class _AsyncFilesSpy:
         except asyncio.CancelledError:
             self.upload_cancelled = True
             raise
+        if self.upload_error is not None:
+            raise self.upload_error
         return SimpleNamespace(
             name="files/official-upload",
             uri="https://files.example.invalid/official-upload",
@@ -1020,15 +1032,77 @@ async def test_official_wrapper_uses_async_files_with_typed_upload_config(
         }
     ]
     assert typed_calls["upload_config"] == [{"mime_type": "video/mp4"}]
-    assert sdk_client.async_files.upload_calls == [
-        {"file": media, "config": ("upload_config", {"mime_type": "video/mp4"})}
-    ]
+    assert len(sdk_client.async_files.upload_calls) == 1
+    upload_call = sdk_client.async_files.upload_calls[0]
+    upload_stream = upload_call["file"]
+    assert isinstance(upload_stream, io.IOBase)
+    assert upload_call["config"] == (
+        "upload_config",
+        {"mime_type": "video/mp4"},
+    )
+    assert sdk_client.async_files.upload_stream_open_during_call == [True]
+    assert sdk_client.async_files.upload_stream_bytes == [b"video"]
+    assert upload_stream.closed is True
     assert sdk_client.async_files.get_calls == [{"name": "files/official-upload"}]
     assert sdk_client.async_files.delete_calls == [
         {"name": "files/official-upload"}
     ]
     assert sdk_client.files.calls == []
     assert active == uploaded
+
+
+@pytest.mark.asyncio
+async def test_official_wrapper_streams_unicode_named_media_without_copying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filesystem basename must never become an ASCII-only upload header."""
+    sdk_client = _OfficialSDKClientSpy()
+    _install_official_sdk_spies(monkeypatch, sdk_client)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+    media = tmp_path / "周杰伦-晴天.音乐"
+    media_bytes = b"private-audio-bytes"
+    media.write_bytes(media_bytes)
+
+    uploaded = await wrapper.upload_file(path=media, mime_type="audio/mpeg")
+
+    upload_stream = sdk_client.async_files.upload_calls[0]["file"]
+    assert isinstance(upload_stream, io.IOBase)
+    assert getattr(upload_stream, "name", None) == str(media)
+    assert sdk_client.async_files.upload_stream_open_during_call == [True]
+    assert sdk_client.async_files.upload_stream_bytes == [media_bytes]
+    assert upload_stream.closed is True
+    assert media.read_bytes() == media_bytes
+    assert uploaded.name == "files/official-upload"
+
+
+@pytest.mark.asyncio
+async def test_official_wrapper_closes_unicode_media_stream_after_sdk_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK failures must not leak an open descriptor for the user's media."""
+    sdk_client = _OfficialSDKClientSpy()
+    sdk_client.async_files.upload_error = RuntimeError("private-sdk-marker")
+    _install_official_sdk_spies(monkeypatch, sdk_client)
+    wrapper = _OfficialGoogleGenAIClient(
+        api_key=secrets.token_urlsafe(24),
+        base_url=None,
+    )
+    media = tmp_path / "失败音频.mp3"
+    media.write_bytes(b"audio")
+
+    with pytest.raises(GeminiClientFailure) as caught:
+        await wrapper.upload_file(path=media, mime_type="audio/mpeg")
+
+    upload_stream = sdk_client.async_files.upload_calls[0]["file"]
+    assert isinstance(upload_stream, io.IOBase)
+    assert upload_stream.closed is True
+    assert caught.value.kind is GeminiFailureKind.UNAVAILABLE
+    assert "private-sdk-marker" not in str(caught.value)
 
 
 @pytest.mark.asyncio
@@ -1061,6 +1135,9 @@ async def test_official_async_upload_propagates_cancellation_without_sync_fallba
             await task
 
     assert sdk_client.async_files.upload_cancelled is True
+    upload_stream = sdk_client.async_files.upload_calls[0]["file"]
+    assert isinstance(upload_stream, io.IOBase)
+    assert upload_stream.closed is True
     assert sdk_client.files.calls == []
 
 

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Gemini Files uploads now use scoped binary streams so Unicode local filenames work
+  without copying private media to ASCII-named temporary files.
+
 ## [0.1.1] - 2026-08-15
 
 - Self-tests now verify successful structured Provider responses without scoring model

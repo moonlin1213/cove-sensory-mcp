@@ -1,4 +1,4 @@
-"""Semantic provider verification is atomic, exact, and privacy safe."""
+"""Provider connectivity verification is atomic, exact, and privacy safe."""
 
 from __future__ import annotations
 
@@ -20,11 +20,7 @@ from cove_sensory_mcp.providers.base import (
     ProviderRequest,
 )
 from cove_sensory_mcp.providers.registry import ProviderRegistry
-from cove_sensory_mcp.reports.schemas import (
-    ObservationEnvelope,
-    ObservationSegment,
-    TranscriptSegment,
-)
+from cove_sensory_mcp.reports.schemas import ObservationEnvelope
 from cove_sensory_mcp.verification.assets import SelfTestAssetStore
 from cove_sensory_mcp.verification.verifier import CapabilityVerifier
 
@@ -74,8 +70,8 @@ def _observation(modality: Modality, summary: str) -> ObservationEnvelope:
     )
 
 
-class SemanticProvider:
-    """Return one exact normalized observation per separately requested modality."""
+class RecordingProvider:
+    """Record requests and return one normalized observation for each modality."""
 
     def __init__(
         self,
@@ -166,7 +162,7 @@ def _configured_store(
 
 def _verifier(
     store: ConfigStore,
-    provider: SemanticProvider,
+    provider: RecordingProvider,
     assets: SelfTestAssetStore,
 ) -> CapabilityVerifier:
     return CapabilityVerifier(
@@ -184,7 +180,7 @@ async def test_declared_image_and_video_are_verified_in_separate_provider_calls(
 ) -> None:
     """Combining modalities would fail providers that verify each capability separately."""
     store = _configured_store(tmp_path)
-    provider = SemanticProvider(
+    provider = RecordingProvider(
         {
             Modality.IMAGE: "A blue triangle is centered on a white background.",
             Modality.VIDEO_VISUAL: "A red ball moves from left to right.",
@@ -223,7 +219,7 @@ async def test_provider_receives_canonical_trusted_asset_not_cwd_same_name(
     (cwd / "fixture.png").write_bytes(b"untrusted")
     monkeypatch.chdir(cwd)
     store = _configured_store(tmp_path)
-    provider = SemanticProvider({Modality.IMAGE: "A blue triangle is visible."})
+    provider = RecordingProvider({Modality.IMAGE: "A blue triangle is visible."})
     relative_assets = SelfTestAssetStore(
         {
             Modality.IMAGE: PreparedMedia(
@@ -248,545 +244,32 @@ async def test_provider_receives_canonical_trusted_asset_not_cwd_same_name(
 
 
 @pytest.mark.parametrize(
-    "summary",
-    [
-        "No blue triangle appears in the image.",
-        "A blue triangle does not appear in the image.",
-        "A blue triangle is not visible.",
-    ],
-)
-@pytest.mark.asyncio
-async def test_image_facts_require_an_affirmative_presence_event(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    summary: str,
-) -> None:
-    store = _configured_store(tmp_path)
-
-    result = await _verifier(
-        store,
-        SemanticProvider({Modality.IMAGE: summary}),
-        assets,
-    ).verify("vision", [Modality.IMAGE])
-
-    assert result[0].verified is False
-
-
-@pytest.mark.parametrize(
     ("modality", "summary"),
     [
-        (
-            Modality.VIDEO_VISUAL,
-            "A red ball moves left rather than right.",
-        ),
-        (
-            Modality.VIDEO_VISUAL,
-            "A red ball moves left instead of right.",
-        ),
-        (
-            Modality.VIDEO_VISUAL,
-            "A red ball moves left other than right.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chimes once rather than twice.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chime twice.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell ring twice.",
-        ),
-        (
-            Modality.AUDIO,
-            "A tone beeps twice rather than three times.",
-        ),
-        (
-            Modality.AUDIO,
-            "A tone sound three times.",
-        ),
-        (
-            Modality.MUSIC,
-            "A piano plays descending rather than ascending.",
-        ),
-        (
-            Modality.IMAGE,
-            "The statement that a blue triangle is visible is false.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chimes twice? No.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chimes twice, but it is not heard.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chimes twice is not heard.",
-        ),
-        (
-            Modality.AUDIO,
-            "A tone beeps three times, but it is not heard.",
-        ),
-        (
-            Modality.AUDIO,
-            "A tone beeps three times is not heard.",
-        ),
-        (
-            Modality.MUSIC,
-            "A piano plays an ascending scale, but it is not heard.",
-        ),
-        (
-            Modality.MUSIC,
-            "A piano plays an ascending scale is not heard.",
-        ),
+        (Modality.IMAGE, "I cannot confidently name the pictured object."),
+        (Modality.VIDEO_VISUAL, "A generic clip is available."),
+        (Modality.VIDEO_AUDIO, "Sound is present, described in another style."),
+        (Modality.AUDIO, "Three short signals may be audible."),
+        (Modality.MUSIC, "听到一段音乐，具体描述风格因模型而异。"),
     ],
 )
 @pytest.mark.asyncio
-async def test_contrasts_questions_and_postposed_denials_do_not_verify(
+async def test_successful_structured_response_verifies_without_scoring_description(
     tmp_path: Path,
     assets: SelfTestAssetStore,
     modality: Modality,
     summary: str,
 ) -> None:
+    """Model wording, language, and confidence must not decide connectivity."""
     store = _configured_store(tmp_path)
 
     result = await _verifier(
         store,
-        SemanticProvider({modality: summary}),
+        RecordingProvider({modality: summary}),
         assets,
     ).verify("vision", [modality])
 
-    assert result[0].verified is False
-
-
-@pytest.mark.parametrize(
-    ("modality", "summary"),
-    [
-        (Modality.IMAGE, "A blue triangle is visible."),
-        (Modality.VIDEO_VISUAL, "A red ball moves to the right."),
-        (Modality.VIDEO_AUDIO, "A bell chimes twice."),
-        (Modality.AUDIO, "A tone beeps three times."),
-        (Modality.MUSIC, "A piano plays an ascending scale."),
-    ],
-)
-@pytest.mark.asyncio
-async def test_each_modality_preserves_its_complete_affirmative_fixture_event(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    modality: Modality,
-    summary: str,
-) -> None:
-    store = _configured_store(tmp_path)
-
-    result = await _verifier(
-        store,
-        SemanticProvider({modality: summary}),
-        assets,
-    ).verify("vision", [modality])
-
-    assert result[0].verified is True
-
-
-@pytest.mark.parametrize(
-    ("modality", "summary"),
-    [
-        (Modality.IMAGE, "A red triangle and a blue circle are visible."),
-        (
-            Modality.VIDEO_VISUAL,
-            "A red square and a blue ball are moving right.",
-        ),
-        (
-            Modality.VIDEO_VISUAL,
-            "A red car is beside a blue ball; it moves right.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell sounds as two lights flash.",
-        ),
-        (Modality.AUDIO, "Three beeps."),
-        (
-            Modality.AUDIO,
-            "Three bells ring while a tone plays once.",
-        ),
-        (Modality.MUSIC, "A piano playing ascending."),
-        (
-            Modality.MUSIC,
-            "A piano plays while an ascending graph is visible.",
-        ),
-        (Modality.VIDEO_VISUAL, "A red ball moving right."),
-        (Modality.IMAGE, "Visible: blue triangle."),
-    ],
-)
-@pytest.mark.asyncio
-async def test_unrelated_subjects_and_nonfinite_phrases_cannot_form_events(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    modality: Modality,
-    summary: str,
-) -> None:
-    store = _configured_store(tmp_path)
-
-    result = await _verifier(
-        store,
-        SemanticProvider({modality: summary}),
-        assets,
-    ).verify("vision", [modality])
-
-    assert result[0].verified is False
-
-
-@pytest.mark.parametrize(
-    ("modality", "summary"),
-    [
-        (
-            Modality.VIDEO_VISUAL,
-            "A red ball moves and a car turns right.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chimes and a light flashes twice.",
-        ),
-        (
-            Modality.AUDIO,
-            "A tone plays and a light flashes three times.",
-        ),
-        (
-            Modality.MUSIC,
-            "A piano plays and an arrow points upward.",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_event_qualifiers_cannot_cross_coordinating_conjunctions(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    modality: Modality,
-    summary: str,
-) -> None:
-    store = _configured_store(tmp_path)
-
-    result = await _verifier(
-        store,
-        SemanticProvider({modality: summary}),
-        assets,
-    ).verify("vision", [modality])
-
-    assert result[0].verified is False
-
-
-@pytest.mark.parametrize(
-    ("modality", "summary", "segment", "transcript"),
-    [
-        (
-            Modality.IMAGE,
-            "A blue object is visible.",
-            "A triangle is present.",
-            "The color is blue.",
-        ),
-        (
-            Modality.VIDEO_VISUAL,
-            "A red ball is visible.",
-            "An object moves.",
-            "The direction is right.",
-        ),
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell is visible.",
-            "Something chimes.",
-            "The count is twice.",
-        ),
-        (
-            Modality.AUDIO,
-            "A tone is present.",
-            "Something beeps.",
-            "The count is three.",
-        ),
-        (
-            Modality.MUSIC,
-            "A piano is present.",
-            "Something plays.",
-            "The contour is ascending.",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_summary_segments_and_transcript_cannot_assemble_one_event(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    modality: Modality,
-    summary: str,
-    segment: str,
-    transcript: str,
-) -> None:
-    store = _configured_store(tmp_path)
-    envelope = ObservationEnvelope(
-        modality=modality,
-        summary=summary,
-        segments=[
-            ObservationSegment(
-                start_seconds=0.0,
-                end_seconds=1.0,
-                text=segment,
-            )
-        ],
-        transcript=[
-            TranscriptSegment(
-                start_seconds=0.0,
-                end_seconds=1.0,
-                text=transcript,
-            )
-        ],
-        warnings=[],
-        confidence="high",
-    )
-
-    result = await _verifier(
-        store,
-        SemanticProvider({modality: envelope}),
-        assets,
-    ).verify("vision", [modality])
-
-    assert result[0].verified is False
-
-
-@pytest.mark.asyncio
-async def test_minimax_native_video_requires_asset_specific_motion_facts(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-) -> None:
-    """Accepting generic video prose would falsely verify byte acceptance as perception."""
-    store = _configured_store(tmp_path, adapter="minimax-m3")
-    generic = SemanticProvider({Modality.VIDEO_VISUAL: "A short video is visible."})
-
-    failed = await _verifier(store, generic, assets).verify(
-        "vision",
-        [Modality.VIDEO_VISUAL],
-    )
-
-    assert failed[0].verified is False
-    assert failed[0].reason == ErrorCode.PROVIDER_CAPABILITY_REJECTED.value
-
-    specific = SemanticProvider(
-        {Modality.VIDEO_VISUAL: "The red ball travels right across the frame."}
-    )
-    passed = await _verifier(store, specific, assets).verify(
-        "vision",
-        [Modality.VIDEO_VISUAL],
-    )
-
-    assert passed[0].verified is True
-
-
-@pytest.mark.asyncio
-async def test_semantic_terms_match_words_not_substrings(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-) -> None:
-    """The word 'bright' must not satisfy the unique rightward-motion fact."""
-    store = _configured_store(tmp_path, adapter="minimax-m3")
-    provider = SemanticProvider(
-        {Modality.VIDEO_VISUAL: "A bright red ball remains centered in the frame."}
-    )
-
-    result = await _verifier(store, provider, assets).verify(
-        "vision",
-        [Modality.VIDEO_VISUAL],
-    )
-
-    assert result[0].verified is False
-    assert result[0].reason == ErrorCode.PROVIDER_CAPABILITY_REJECTED.value
-
-
-@pytest.mark.asyncio
-async def test_video_position_without_motion_does_not_verify_native_video(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-) -> None:
-    """A red ball located on the right is not evidence that motion was perceived."""
-    store = _configured_store(tmp_path, adapter="minimax-m3")
-    provider = SemanticProvider(
-        {Modality.VIDEO_VISUAL: "A stationary red ball sits on the right side."}
-    )
-
-    result = await _verifier(store, provider, assets).verify(
-        "vision",
-        [Modality.VIDEO_VISUAL],
-    )
-
-    assert result[0].verified is False
-
-
-@pytest.mark.parametrize(
-    "summary",
-    [
-        "No motion; a red ball remains on the right.",
-        "The red ball does not move to the right.",
-        "The red ball is not moving right.",
-        "The red ball never moves right.",
-        "The red ball remains still on the right.",
-        "The red ball appears not to move right.",
-        "The red ball cannot move right.",
-        "The red ball can't move right.",
-        "The red ball fails to move right.",
-        "The red ball is shown without moving right.",
-    ],
-)
-@pytest.mark.asyncio
-async def test_targeted_motion_negations_never_verify_video(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    summary: str,
-) -> None:
-    store = _configured_store(tmp_path, adapter="minimax-m3")
-    provider = SemanticProvider({Modality.VIDEO_VISUAL: summary})
-
-    result = await _verifier(store, provider, assets).verify(
-        "vision", [Modality.VIDEO_VISUAL]
-    )
-
-    assert result[0].verified is False
-
-
-@pytest.mark.asyncio
-async def test_explicit_positive_motion_with_direction_verifies_video(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-) -> None:
-    store = _configured_store(tmp_path, adapter="minimax-m3")
-    provider = SemanticProvider(
-        {Modality.VIDEO_VISUAL: "The red ball moves to the right."}
-    )
-
-    result = await _verifier(store, provider, assets).verify(
-        "vision", [Modality.VIDEO_VISUAL]
-    )
-
-    assert result[0].verified is True
-
-
-@pytest.mark.asyncio
-async def test_negated_stationary_clause_does_not_negate_later_positive_motion(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-) -> None:
-    store = _configured_store(tmp_path, adapter="minimax-m3")
-    provider = SemanticProvider(
-        {Modality.VIDEO_VISUAL: "The red ball is not stationary; it moves right."}
-    )
-
-    result = await _verifier(store, provider, assets).verify(
-        "vision", [Modality.VIDEO_VISUAL]
-    )
-
-    assert result[0].verified is True
-
-
-@pytest.mark.parametrize(
-    ("modality", "passing", "failing"),
-    [
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chimes twice.",
-            "There is generic audio in the video.",
-        ),
-        (
-            Modality.MUSIC,
-            "A piano plays an ascending scale.",
-            "Music can be heard.",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_video_audio_and_music_require_direct_semantic_facts(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    modality: Modality,
-    passing: str,
-    failing: str,
-) -> None:
-    store = _configured_store(tmp_path)
-    passed = await _verifier(
-        store, SemanticProvider({modality: passing}), assets
-    ).verify("vision", [modality])
-    failed = await _verifier(
-        store, SemanticProvider({modality: failing}), assets
-    ).verify("vision", [modality])
-
-    assert passed[0].verified is True
-    assert failed[0].verified is False
-
-
-@pytest.mark.parametrize(
-    ("modality", "positive", "negated"),
-    [
-        (
-            Modality.VIDEO_AUDIO,
-            "A bell chimes twice.",
-            "A bell doesn't chime twice.",
-        ),
-        (
-            Modality.AUDIO,
-            "A tone beeps three times.",
-            "A tone does not beep three times.",
-        ),
-        (
-            Modality.MUSIC,
-            "A piano plays an ascending scale.",
-            "No piano plays an ascending scale.",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_hearing_modalities_require_local_affirmative_events(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    modality: Modality,
-    positive: str,
-    negated: str,
-) -> None:
-    store = _configured_store(tmp_path)
-    positive_result = await _verifier(
-        store,
-        SemanticProvider({modality: positive}),
-        assets,
-    ).verify("vision", [modality])
-    negated_result = await _verifier(
-        store,
-        SemanticProvider({modality: negated}),
-        assets,
-    ).verify("vision", [modality])
-
-    assert positive_result[0].verified is True
-    assert negated_result[0].verified is False
-
-
-@pytest.mark.parametrize(
-    ("modality", "noun_only"),
-    [
-        (Modality.AUDIO, "Three beep tones."),
-        (Modality.MUSIC, "An ascending piano scale."),
-    ],
-)
-@pytest.mark.asyncio
-async def test_audio_and_music_nouns_without_event_verbs_do_not_verify(
-    tmp_path: Path,
-    assets: SelfTestAssetStore,
-    modality: Modality,
-    noun_only: str,
-) -> None:
-    store = _configured_store(tmp_path)
-
-    result = await _verifier(
-        store,
-        SemanticProvider({modality: noun_only}),
-        assets,
-    ).verify("vision", [modality])
-
-    assert result[0].verified is False
+    assert [(item.verified, item.reason) for item in result] == [(True, None)]
 
 
 @pytest.mark.asyncio
@@ -799,7 +282,7 @@ async def test_undeclared_modality_makes_no_provider_call_or_config_write(
     provider_config.declared_capabilities[Modality.MUSIC] = False
     store.save(AppConfig(providers={"vision": provider_config}))
     store.save_calls = 0
-    provider = SemanticProvider({Modality.MUSIC: "A piano scale rises upward."})
+    provider = RecordingProvider({Modality.MUSIC: "A piano scale rises upward."})
 
     with pytest.raises(SensoryError) as caught:
         await _verifier(store, provider, assets).verify("vision", [Modality.MUSIC])
@@ -826,7 +309,7 @@ async def test_batch_updates_requested_capabilities_once_and_preserves_unrelated
         )
     )
     store.save_calls = 0
-    provider = SemanticProvider(
+    provider = RecordingProvider(
         {
             Modality.IMAGE: "The test image contains a blue triangle.",
             Modality.VIDEO_VISUAL: "Generic moving imagery.",
@@ -838,11 +321,12 @@ async def test_batch_updates_requested_capabilities_once_and_preserves_unrelated
         [Modality.IMAGE, Modality.VIDEO_VISUAL],
     )
 
-    assert [item.verified for item in results] == [True, False]
+    assert [item.verified for item in results] == [True, True]
     assert store.save_calls == 1
     saved = store.load().providers["vision"]
     assert saved.verified_capabilities == {
         Modality.IMAGE: True,
+        Modality.VIDEO_VISUAL: True,
         Modality.AUDIO: True,
     }
     assert saved.last_verified_at == _VERIFIED_AT
@@ -872,7 +356,7 @@ async def test_verifier_reloads_before_atomic_write_to_preserve_unrelated_change
         )
         external.save(latest)
 
-    provider = SemanticProvider(
+    provider = RecordingProvider(
         {Modality.IMAGE: "A white card displays a blue triangle."},
         before_return=add_unrelated_provider,
     )
@@ -899,7 +383,7 @@ async def test_provider_identity_conflict_during_remote_call_aborts_without_over
 
         external.update(mutate)
 
-    provider = SemanticProvider(
+    provider = RecordingProvider(
         {Modality.IMAGE: "A blue triangle is visible."},
         before_return=change_model,
     )
@@ -921,7 +405,7 @@ async def test_cancellation_and_local_asset_errors_never_partially_write(
 ) -> None:
     """Cancellation or missing local fixtures must leave prior verification untouched."""
     store = _configured_store(tmp_path)
-    cancelling = SemanticProvider({Modality.IMAGE: asyncio.CancelledError()})
+    cancelling = RecordingProvider({Modality.IMAGE: asyncio.CancelledError()})
 
     with pytest.raises(asyncio.CancelledError):
         await _verifier(store, cancelling, assets).verify("vision", [Modality.IMAGE])
@@ -929,7 +413,7 @@ async def test_cancellation_and_local_asset_errors_never_partially_write(
     assert store.save_calls == 0
 
     missing_assets = SelfTestAssetStore({}, trusted_root=tmp_path)
-    missing_provider = SemanticProvider({Modality.IMAGE: "blue triangle"})
+    missing_provider = RecordingProvider({Modality.IMAGE: "blue triangle"})
     with pytest.raises(SensoryError) as caught:
         await _verifier(
             store,
@@ -947,9 +431,9 @@ async def test_provider_configuration_error_aborts_batch_without_any_write(
     tmp_path: Path,
     assets: SelfTestAssetStore,
 ) -> None:
-    """A later configuration fault must not commit an earlier semantic success."""
+    """A later configuration fault must not commit an earlier successful response."""
     store = _configured_store(tmp_path)
-    provider = SemanticProvider(
+    provider = RecordingProvider(
         {
             Modality.IMAGE: "A blue triangle is visible.",
             Modality.VIDEO_VISUAL: SensoryError(
@@ -979,7 +463,7 @@ async def test_failures_return_only_stable_reasons_without_paths_or_provider_tex
     """Self-test output must not reveal a fixture path or raw provider diagnostics."""
     store = _configured_store(tmp_path)
     marker = "private-provider-body-marker"
-    provider = SemanticProvider(
+    provider = RecordingProvider(
         {
             Modality.IMAGE: SensoryError(
                 ErrorCode.PROVIDER_SAFETY_REJECTED,
@@ -1007,7 +491,7 @@ async def test_mismatched_provider_model_fails_through_the_exact_executor_bounda
 ) -> None:
     """Trusting adapter metadata would verify a model other than the configured one."""
     store = _configured_store(tmp_path)
-    provider = SemanticProvider(
+    provider = RecordingProvider(
         {Modality.IMAGE: "A blue triangle."},
         returned_model="wrong-model",
     )

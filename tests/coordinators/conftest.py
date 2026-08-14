@@ -31,9 +31,11 @@ class Executor:
     def __init__(self, failures: set[Modality] | None = None) -> None:
         self.failures = failures or set()
         self.calls: list[frozenset[Modality]] = []
+        self.requests = []
 
     async def sense(self, modalities, request):
         self.calls.append(modalities)
+        self.requests.append(request)
         observations = {
             modality: ObservationEnvelope(
                 modality=modality, summary=f"seen {modality.value}", confidence="medium"

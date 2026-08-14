@@ -45,7 +45,9 @@ stores only the variable name. Add each readable local directory separately with
   separate audio provider for a video's soundtrack.
 - A custom provider must declare capabilities and pass the tiny-media self-test before
   those capabilities are advertised. The self-test sends project-created media, can
-  incur a small API cost, and requires confirmation.
+  incur a small API cost, and requires confirmation. It verifies that the Provider call
+  returns a valid structured observation; it does not score the model's wording or
+  description style.
 
 Media is sent only to the selected, authorized Provider. Its privacy policy, retention,
 region, and billing rules apply. Cross-provider fallback is never inferred. Local paths

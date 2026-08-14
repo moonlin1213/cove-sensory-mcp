@@ -50,6 +50,12 @@ async def test_video_preserves_visual_partial_when_audio_fails(
         prepare=prepare,
         extract_audio=extract,
     ).sense(request_factory(str(source)))
+    audio_request = next(
+        request
+        for request in executor.requests
+        if request.requested_modalities == frozenset({Modality.VIDEO_AUDIO})
+    )
+    assert audio_request.media.media_kind is MediaKind.AUDIO
     assert result.status == "partial"
     assert result.coverage.visual is True and result.coverage.audio is False
 

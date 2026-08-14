@@ -51,6 +51,7 @@ def _response_text(*modalities: Modality) -> str:
 class FakeGeminiClient:
     def __init__(self, generation: GeminiGeneration) -> None:
         self.generation = generation
+        self.generation_responses: list[GeminiGeneration] = []
         self.uploads: list[tuple[Path, str]] = []
         self.waited_for: list[GeminiRemoteFile] = []
         self.generate_calls: list[dict[str, object]] = []
@@ -105,6 +106,8 @@ class FakeGeminiClient:
             await self.generate_gate.wait()
         if self.generate_error is not None:
             raise self.generate_error
+        if self.generation_responses:
+            return self.generation_responses.pop(0)
         return self.generation
 
     async def delete_file(self, *, name: str) -> None:
@@ -274,6 +277,12 @@ async def test_video_uploads_once_and_places_prompt_after_media(tmp_path: Path) 
             "video/mp4",
             id="video-audio",
         ),
+        pytest.param(
+            Modality.VIDEO_AUDIO,
+            MediaKind.AUDIO,
+            "audio/wav",
+            id="extracted-video-audio",
+        ),
         pytest.param(Modality.AUDIO, MediaKind.AUDIO, "audio/wav", id="audio"),
         pytest.param(Modality.MUSIC, MediaKind.AUDIO, "audio/flac", id="music"),
     ],
@@ -354,7 +363,37 @@ async def test_uploaded_file_is_deleted_when_normalization_fails(tmp_path: Path)
         )
 
     assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+    assert len(client.generate_calls) == 2
     assert client.deleted_names == ["files/test-upload"]
+
+
+@pytest.mark.asyncio
+async def test_music_retries_malformed_json_once_with_zero_default_temperature(
+    tmp_path: Path,
+) -> None:
+    """Structured music output should recover without inheriting Gemini's randomness."""
+    audio = tmp_path / "music.wav"
+    audio.write_bytes(b"music")
+    client = FakeGeminiClient(GeminiGeneration(text=_response_text(Modality.MUSIC)))
+    client.generation_responses = [
+        GeminiGeneration(text="{malformed-json"),
+        GeminiGeneration(text=_response_text(Modality.MUSIC)),
+    ]
+
+    result = await _provider(client, config=_config(temperature=None)).sense(
+        _request(
+            audio,
+            media_kind=MediaKind.AUDIO,
+            mime_type="audio/wav",
+            modalities=frozenset({Modality.MUSIC}),
+            duration_seconds=1,
+        )
+    )
+
+    assert [call["temperature"] for call in client.generate_calls] == [0.0, 0.0]
+    assert client.uploads == [(audio, "audio/wav")]
+    assert client.deleted_names == ["files/test-upload"]
+    assert result.observations[Modality.MUSIC].summary == "Observed music."
 
 
 @pytest.mark.asyncio

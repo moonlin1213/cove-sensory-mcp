@@ -1,4 +1,4 @@
-"""Capability self-test assets and semantic verification."""
+"""Capability self-test assets and Provider connectivity verification."""
 
 from .assets import SelfTestAssetStore
 from .verifier import CapabilityVerifier

@@ -23,6 +23,8 @@ from .base import MediaKind, ProviderCallResult, ProviderRequest
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_INLINE_MAX_BYTES = 20 * 1024 * 1024
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
+_DEFAULT_TEMPERATURE = 0.0
+_MAX_FORMAT_ATTEMPTS = 2
 _FILE_POLL_INTERVAL_SECONDS = 0.5
 
 _AUTH_MESSAGE = "The provider credential was rejected."
@@ -414,7 +416,9 @@ def _modalities_match_media(request: ProviderRequest) -> bool:
     allowed = {
         MediaKind.IMAGE: frozenset({Modality.IMAGE}),
         MediaKind.VIDEO: frozenset({Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO}),
-        MediaKind.AUDIO: frozenset({Modality.AUDIO, Modality.MUSIC}),
+        MediaKind.AUDIO: frozenset(
+            {Modality.VIDEO_AUDIO, Modality.AUDIO, Modality.MUSIC}
+        ),
     }[request.media.media_kind]
     return bool(request.requested_modalities) and request.requested_modalities <= allowed
 
@@ -556,24 +560,38 @@ class GeminiProvider:
                                 mime_type=active_file.mime_type,
                             )
                         contents = self._ordered_contents(request, media)
-                        generation = await client.generate_content(
-                            model=self._config.model,
-                            contents=contents,
-                            max_output_tokens=(
-                                self._config.adapter_options.max_output_tokens
-                            ),
-                            temperature=self._config.adapter_options.temperature,
-                        )
-                        if generation.safety_rejected:
-                            raise GeminiClientFailure(GeminiFailureKind.SAFETY)
-                        if generation.text is None:
-                            raise GeminiClientFailure(GeminiFailureKind.UNAVAILABLE)
-                        batch = normalize_provider_text(
-                            generation.text,
-                            expected_modalities=request.requested_modalities,
-                            duration_seconds=request.media.duration_seconds,
-                        )
-                        observations = batch.by_modality()
+                        temperature = self._config.adapter_options.temperature
+                        if temperature is None:
+                            temperature = _DEFAULT_TEMPERATURE
+                        for attempt in range(_MAX_FORMAT_ATTEMPTS):
+                            generation = await client.generate_content(
+                                model=self._config.model,
+                                contents=contents,
+                                max_output_tokens=(
+                                    self._config.adapter_options.max_output_tokens
+                                ),
+                                temperature=temperature,
+                            )
+                            if generation.safety_rejected:
+                                raise GeminiClientFailure(GeminiFailureKind.SAFETY)
+                            if generation.text is None:
+                                raise GeminiClientFailure(GeminiFailureKind.UNAVAILABLE)
+                            try:
+                                batch = normalize_provider_text(
+                                    generation.text,
+                                    expected_modalities=request.requested_modalities,
+                                    duration_seconds=request.media.duration_seconds,
+                                )
+                            except SensoryError as exc:
+                                if (
+                                    exc.code
+                                    is not ErrorCode.PROVIDER_CAPABILITY_REJECTED
+                                    or attempt + 1 == _MAX_FORMAT_ATTEMPTS
+                                ):
+                                    raise
+                                continue
+                            observations = batch.by_modality()
+                            break
                 except TimeoutError:
                     pending_error = _public_error(GeminiFailureKind.TIMEOUT)
                 except GeminiClientFailure as exc:

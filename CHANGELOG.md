@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+- Self-tests now verify successful structured Provider responses without scoring model
+  wording against fixture-specific English phrases.
+- Gemini structured requests default to `temperature=0` when no temperature is
+  configured and retry malformed observation JSON once.
+- Gemini accepts extracted audio files for `video_audio` observations, restoring split
+  eye/ear video routing across different Providers.
+
 ## [0.1.0] - release candidate
 
 - Initial local stdio MCP with seven sensory tools.

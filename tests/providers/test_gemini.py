@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import secrets
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,10 @@ class FakeGeminiClient:
     def __init__(self, generation: GeminiGeneration) -> None:
         self.generation = generation
         self.generation_responses: list[GeminiGeneration] = []
+        self.generation_for_contents: Callable[
+            [tuple[str | GeminiInlineMedia | GeminiUploadedMedia, ...]],
+            GeminiGeneration,
+        ] | None = None
         self.uploads: list[tuple[Path, str]] = []
         self.waited_for: list[GeminiRemoteFile] = []
         self.generate_calls: list[dict[str, object]] = []
@@ -106,6 +111,8 @@ class FakeGeminiClient:
             await self.generate_gate.wait()
         if self.generate_error is not None:
             raise self.generate_error
+        if self.generation_for_contents is not None:
+            return self.generation_for_contents(contents)
         if self.generation_responses:
             return self.generation_responses.pop(0)
         return self.generation
@@ -368,17 +375,24 @@ async def test_uploaded_file_is_deleted_when_normalization_fails(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_music_retries_malformed_json_once_with_zero_default_temperature(
+async def test_music_retries_deterministic_truncation_with_correction_prompt(
     tmp_path: Path,
 ) -> None:
-    """Structured music output should recover without inheriting Gemini's randomness."""
+    """Repeating an identical temperature-zero prompt would reproduce broken JSON."""
     audio = tmp_path / "music.wav"
     audio.write_bytes(b"music")
-    client = FakeGeminiClient(GeminiGeneration(text=_response_text(Modality.MUSIC)))
-    client.generation_responses = [
-        GeminiGeneration(text="{malformed-json"),
-        GeminiGeneration(text=_response_text(Modality.MUSIC)),
-    ]
+    valid_response = _response_text(Modality.MUSIC)
+    client = FakeGeminiClient(GeminiGeneration(text=valid_response))
+
+    def generate_for_prompt(
+        contents: tuple[str | GeminiInlineMedia | GeminiUploadedMedia, ...],
+    ) -> GeminiGeneration:
+        prompt = next(item for item in contents if isinstance(item, str))
+        if "FORMAT RETRY:" not in prompt:
+            return GeminiGeneration(text=valid_response[:-1])
+        return GeminiGeneration(text=valid_response)
+
+    client.generation_for_contents = generate_for_prompt
 
     result = await _provider(client, config=_config(temperature=None)).sense(
         _request(
@@ -391,6 +405,17 @@ async def test_music_retries_malformed_json_once_with_zero_default_temperature(
     )
 
     assert [call["temperature"] for call in client.generate_calls] == [0.0, 0.0]
+    prompts = [
+        next(
+            item
+            for item in cast(tuple[object, ...], call["contents"])
+            if isinstance(item, str)
+        )
+        for call in client.generate_calls
+    ]
+    assert "FORMAT RETRY:" not in prompts[0]
+    assert "FORMAT RETRY:" in prompts[1]
+    assert prompts[0] != prompts[1]
     assert client.uploads == [(audio, "audio/wav")]
     assert client.deleted_names == ["files/test-upload"]
     assert result.observations[Modality.MUSIC].summary == "Observed music."

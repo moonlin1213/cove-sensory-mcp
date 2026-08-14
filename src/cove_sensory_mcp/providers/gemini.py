@@ -25,6 +25,11 @@ _DEFAULT_INLINE_MAX_BYTES = 20 * 1024 * 1024
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 _DEFAULT_TEMPERATURE = 0.0
 _MAX_FORMAT_ATTEMPTS = 2
+_FORMAT_RETRY_INSTRUCTION = (
+    "FORMAT RETRY: Produce one complete JSON object matching the requested contract. "
+    "Close every string, array, and object, including the final top-level object. "
+    "Return no Markdown fences, commentary, or trailing text."
+)
 _FILE_POLL_INTERVAL_SECONDS = 0.5
 
 _AUTH_MESSAGE = "The provider credential was rejected."
@@ -508,8 +513,12 @@ class GeminiProvider:
         self,
         request: ProviderRequest,
         media: GeminiInlineMedia | GeminiUploadedMedia,
+        *,
+        format_retry: bool = False,
     ) -> tuple[GeminiContent, ...]:
         prompt = self._prompt(request)
+        if format_retry:
+            prompt = f"{prompt}\n{_FORMAT_RETRY_INSTRUCTION}"
         if request.media.media_kind in {MediaKind.IMAGE, MediaKind.VIDEO}:
             return media, prompt
         return prompt, media
@@ -559,11 +568,15 @@ class GeminiProvider:
                                 uri=active_file.uri,
                                 mime_type=active_file.mime_type,
                             )
-                        contents = self._ordered_contents(request, media)
                         temperature = self._config.adapter_options.temperature
                         if temperature is None:
                             temperature = _DEFAULT_TEMPERATURE
                         for attempt in range(_MAX_FORMAT_ATTEMPTS):
+                            contents = self._ordered_contents(
+                                request,
+                                media,
+                                format_retry=attempt > 0,
+                            )
                             generation = await client.generate_content(
                                 model=self._config.model,
                                 contents=contents,

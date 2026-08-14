@@ -18,7 +18,7 @@ from .assets import SelfTestAssetStore
 
 _CONFIG_MESSAGE = "The provider verification configuration is invalid."
 _ABORT_MESSAGE = "The capability self-test could not run safely."
-_FOCUS = "Return a structured observation for this capability test media."
+_FOCUS = "Direct observations from the capability test media."
 
 _BATCH_ABORT_CODES = frozenset(
     {

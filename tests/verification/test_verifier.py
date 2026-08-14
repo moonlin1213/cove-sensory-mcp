@@ -202,7 +202,10 @@ async def test_declared_image_and_video_are_verified_in_separate_provider_calls(
     ]
     assert provider.requests[0].media.path.name == "tiny-image.png"
     assert provider.requests[1].media.path.name == "tiny-motion.mp4"
-    assert all("blue" not in request.question.lower() for request in provider.requests)
+    assert all(
+        request.question == "Direct observations from the capability test media."
+        for request in provider.requests
+    )
 
 
 @pytest.mark.asyncio

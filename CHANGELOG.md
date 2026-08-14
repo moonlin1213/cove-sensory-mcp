@@ -5,7 +5,8 @@
 - Self-tests now verify successful structured Provider responses without scoring model
   wording against fixture-specific English phrases.
 - Gemini structured requests default to `temperature=0` when no temperature is
-  configured and retry malformed observation JSON once.
+  configured and retry malformed observation JSON once with a distinct format-correction
+  prompt, avoiding deterministic repeats of the same truncated output.
 - Gemini accepts extracted audio files for `video_audio` observations, restoring split
   eye/ear video routing across different Providers.
 

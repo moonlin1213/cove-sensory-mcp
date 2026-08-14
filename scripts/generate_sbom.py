@@ -31,8 +31,8 @@ def generate(lockfile: Path, output: Path) -> None:
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
         "SPDXID": "SPDXRef-DOCUMENT",
-        "name": "cove-sensory-mcp-0.1.0",
-        "documentNamespace": "https://example.invalid/cove-sensory-mcp/0.1.0/sbom",
+        "name": "cove-sensory-mcp-0.1.1",
+        "documentNamespace": "https://example.invalid/cove-sensory-mcp/0.1.1/sbom",
         "creationInfo": {"created": "2026-08-04T00:00:00Z", "creators": ["Tool: cove-sensory-mcp-generate-sbom"]},
         "packages": packages,
     }

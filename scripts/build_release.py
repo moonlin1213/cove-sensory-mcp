@@ -49,7 +49,7 @@ def build_archive(platform_tag: str, source: Path, output: Path) -> Path:
     if not source.is_dir():
         raise ValueError("PyInstaller onedir build is missing")
     output.mkdir(parents=True, exist_ok=True)
-    stem = f"cove-sensory-mcp-0.1.0-{platform_tag}"
+    stem = f"cove-sensory-mcp-0.1.1-{platform_tag}"
     if platform_tag == "windows-x64":
         archive = output / f"{stem}.zip"
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as target:

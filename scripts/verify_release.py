@@ -123,7 +123,7 @@ def verify(archive: Path, platform_tag: str, *, execute: bool = True) -> None:
         if os.name != "nt":
             executable.chmod(executable.stat().st_mode | 0o100)
         version = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=20, check=False)
-        if version.returncode or "0.1.0" not in version.stdout:
+        if version.returncode or "0.1.1" not in version.stdout:
             raise ValueError("version smoke test failed")
         doctor = subprocess.run([str(executable), "doctor"], capture_output=True, text=True, timeout=30, check=False)
         if doctor.returncode not in {0, 1} or "Config:" not in doctor.stdout:

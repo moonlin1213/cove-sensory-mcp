@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-15
+
 - Self-tests now verify successful structured Provider responses without scoring model
   wording against fixture-specific English phrases.
 - Gemini structured requests default to `temperature=0` when no temperature is

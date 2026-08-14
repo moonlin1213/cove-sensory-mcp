@@ -2,7 +2,7 @@
 param(
   [string]$Archive,
   [string]$Sha256,
-  [string]$Version = "0.1.0",
+  [string]$Version = "0.1.1",
   [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "CoveSensoryMCP\bin"),
   [switch]$ConfirmPath,
   [switch]$Uninstall,

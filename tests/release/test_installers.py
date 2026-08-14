@@ -34,7 +34,7 @@ def test_macos_installer_verifies_and_activates_inside_injected_home(tmp_path: P
     executable.chmod(0o755)
     machine = subprocess.check_output(["uname", "-m"], text=True).strip()
     tag = "macos-arm64" if machine in {"arm64", "aarch64"} else "macos-x64"
-    archive = tmp_path / f"cove-sensory-mcp-0.1.0-{tag}.tar.gz"
+    archive = tmp_path / f"cove-sensory-mcp-0.1.1-{tag}.tar.gz"
     with tarfile.open(archive, "w:gz") as target:
         target.add(tree, arcname="cove-sensory-mcp")
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()

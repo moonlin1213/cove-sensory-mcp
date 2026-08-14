@@ -53,7 +53,7 @@ jobs:
           signtool sign /fd SHA256 /f certificate.pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD dist/cove-sensory-mcp/cove-sensory-mcp.exe
           signtool verify /pa dist/cove-sensory-mcp/cove-sensory-mcp.exe
       - run: uv run python scripts/build_release.py --platform-tag ${{ matrix.tag }} --output dist/release
-      - run: uv run python scripts/verify_release.py ${{ startsWith(matrix.tag, 'windows-') && format('dist/release/cove-sensory-mcp-0.1.0-{0}.zip', matrix.tag) || format('dist/release/cove-sensory-mcp-0.1.0-{0}.tar.gz', matrix.tag) }} --platform-tag ${{ matrix.tag }}
+      - run: uv run python scripts/verify_release.py ${{ startsWith(matrix.tag, 'windows-') && format('dist/release/cove-sensory-mcp-0.1.1-{0}.zip', matrix.tag) || format('dist/release/cove-sensory-mcp-0.1.1-{0}.tar.gz', matrix.tag) }} --platform-tag ${{ matrix.tag }}
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: standalone-${{ matrix.tag }}

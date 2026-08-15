@@ -193,6 +193,7 @@ class AdapterOptions(BaseModel):
         "input_audio_base64",
         "video_url_data_uri",
         "anthropic_base64_media",
+        "audio_url_data_uri",
     ] | None = None
     extra_headers_env: Annotated[
         dict[StrictStr, StrictStr],

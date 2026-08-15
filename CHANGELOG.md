@@ -4,6 +4,13 @@
 
 - Gemini Files uploads now use scoped binary streams so Unicode local filenames work
   without copying private media to ASCII-named temporary files.
+- OpenAI-compatible audio Providers gain an `audio_url_data_uri` media mode for platforms
+  that accept audio through an `audio_url` content part (for example SiliconFlow
+  Qwen3-Omni), covering `audio`, `music`, and `video_audio` modalities.
+- OpenAI-compatible calls now share one bounded retry across transient 408, 429, 500,
+  502, 503, and 504 responses, connection/timeout failures, and malformed structured
+  output. The retry uses a corrective prompt for incomplete JSON and invalid transcript
+  shapes and remains inside one overall request deadline.
 
 ## [0.1.1] - 2026-08-15
 

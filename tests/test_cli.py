@@ -868,11 +868,16 @@ def test_configure_custom_provider_saves_only_declared_supported_capabilities(
             "n",
         ]
     )
+    prompts: list[str] = []
+
+    def answer(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
 
     assert (
         run_configure(
             tmp_services,
-            input_fn=lambda _: next(answers),
+            input_fn=answer,
             secret_input_fn=lambda _: "custom-provider-secret",
             output=lambda _: None,
         )
@@ -883,6 +888,7 @@ def test_configure_custom_provider_saves_only_declared_supported_capabilities(
     assert provider.adapter == "openai-compatible"
     assert provider.adapter_options.endpoint_path == "/v1/chat/completions"
     assert provider.adapter_options.media_part_mode == "input_audio_base64"
+    assert any("audio_url_data_uri" in prompt for prompt in prompts)
     assert provider.declared_capabilities == {
         "image": False,
         "video_visual": False,
@@ -964,6 +970,7 @@ def test_configure_custom_rejects_capabilities_outside_one_wire_mode(
     [
         ("image_url_data_uri", Modality.IMAGE, MediaKind.IMAGE, "image/png"),
         ("input_audio_base64", Modality.AUDIO, MediaKind.AUDIO, "audio/wav"),
+        ("audio_url_data_uri", Modality.MUSIC, MediaKind.AUDIO, "audio/mpeg"),
         (
             "video_url_data_uri",
             Modality.VIDEO_VISUAL,

@@ -44,6 +44,7 @@ CustomMediaPartMode = Literal[
     "input_audio_base64",
     "video_url_data_uri",
     "anthropic_base64_media",
+    "audio_url_data_uri",
 ]
 _PROVIDER_ID_ADAPTER = TypeAdapter(ProviderId)
 _CANCEL_VALUES = frozenset({"cancel", "quit", "q"})
@@ -172,7 +173,7 @@ def _provider_from_answers(
         media_part_mode_value = _clean_answer(
             input_fn,
             "Media part mode [image_url_data_uri/input_audio_base64/"
-            "video_url_data_uri/anthropic_base64_media]: ",
+            "video_url_data_uri/anthropic_base64_media/audio_url_data_uri]: ",
         ).lower()
         supported_capabilities = media_part_mode_capabilities(media_part_mode_value)
         if supported_capabilities is None:

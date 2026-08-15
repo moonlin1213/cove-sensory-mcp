@@ -701,6 +701,7 @@ def test_known_adapter_options_remain_portable(tmp_path: Path) -> None:
         "input_audio_base64",
         "video_url_data_uri",
         "anthropic_base64_media",
+        "audio_url_data_uri",
     ],
 )
 def test_adapter_options_accepts_each_v1_media_part_mode(mode: str) -> None:

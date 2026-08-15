@@ -23,6 +23,7 @@ from cove_sensory_mcp.errors import ErrorCode, SensoryError
 from cove_sensory_mcp.models import DetailLevel, Modality
 from cove_sensory_mcp.providers.base import MediaKind, PreparedMedia, ProviderRequest
 from cove_sensory_mcp.providers.openai_compatible import OpenAICompatibleProvider
+from cove_sensory_mcp.reports.prompts import build_sensory_prompt
 
 _PRIMARY_SECRET = "primary-custom-provider-secret"
 _EXTRA_HEADER_ENV = "COVE_TEST_CUSTOM_HEADER"
@@ -73,9 +74,16 @@ def _config(
     if capabilities is None:
         capabilities = {
             "image_url_data_uri": frozenset({Modality.IMAGE}),
-            "input_audio_base64": frozenset({Modality.AUDIO, Modality.MUSIC}),
-            "video_url_data_uri": frozenset({Modality.VIDEO_VISUAL}),
+            "input_audio_base64": frozenset(
+                {Modality.VIDEO_AUDIO, Modality.AUDIO, Modality.MUSIC}
+            ),
+            "video_url_data_uri": frozenset(
+                {Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO}
+            ),
             "anthropic_base64_media": frozenset({Modality.IMAGE}),
+            "audio_url_data_uri": frozenset(
+                {Modality.VIDEO_AUDIO, Modality.AUDIO, Modality.MUSIC}
+            ),
         }.get(mode, frozenset({Modality.IMAGE}))
     declared = {modality: True for modality in capabilities}
     return ProviderConfig(
@@ -169,33 +177,13 @@ def _provider(
 
 
 def _prompt(modality: Modality) -> str:
-    return "\n".join(
-        [
-            "Return only valid JSON matching the ProviderObservationBatch contract.",
-            'The top-level object has exactly one key, "observations".',
-            f'The observations array must contain modalities exactly: ["{modality.value}"].',
-            "Return one observation per requested modality, with no duplicates or extra modalities.",
-            (
-                "Each observation has exactly these fields: modality, summary, segments, transcript, "
-                "warnings, confidence."
-            ),
-            (
-                "Each segment and transcript item has start_seconds, end_seconds, and text. Each "
-                "warning has code and message. confidence is low, medium, or high."
-            ),
-            (
-                "Report direct observations and concrete evidence. State uncertainty explicitly when "
-                "the media does not support a confident observation."
-            ),
-            (
-                "Do not invent identities, diagnoses, causal claims, events, dialogue, or lyrics not "
-                "directly supported by the media."
-            ),
-            (
-                'REQUEST_SCOPE: {"detail":"quick","language":"en","start_seconds":null,'
-                '"end_seconds":null}'
-            ),
-        ]
+    return build_sensory_prompt(
+        frozenset({modality}),
+        None,
+        DetailLevel.QUICK,
+        "en",
+        None,
+        None,
     )
 
 
@@ -223,6 +211,39 @@ def _prompt(modality: Modality) -> str:
                 "input_audio": {"data": "bWVkaWEtYnl0ZXM=", "format": "wav"},
             },
             id="input-audio-base64",
+        ),
+        pytest.param(
+            "audio_url_data_uri",
+            MediaKind.AUDIO,
+            "audio/wav",
+            Modality.AUDIO,
+            {
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/wav;base64,bWVkaWEtYnl0ZXM="},
+            },
+            id="audio-url-data-uri-audio",
+        ),
+        pytest.param(
+            "audio_url_data_uri",
+            MediaKind.AUDIO,
+            "audio/mpeg",
+            Modality.MUSIC,
+            {
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/mpeg;base64,bWVkaWEtYnl0ZXM="},
+            },
+            id="audio-url-data-uri-music",
+        ),
+        pytest.param(
+            "audio_url_data_uri",
+            MediaKind.AUDIO,
+            "audio/wav",
+            Modality.VIDEO_AUDIO,
+            {
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/wav;base64,bWVkaWEtYnl0ZXM="},
+            },
+            id="audio-url-data-uri-video-audio",
         ),
         pytest.param(
             "video_url_data_uri",
@@ -309,6 +330,7 @@ async def test_each_named_mode_emits_its_exact_bounded_request_shape(
         pytest.param("input_audio_base64", Modality.IMAGE, id="audio-claims-image"),
         pytest.param("video_url_data_uri", Modality.AUDIO, id="video-claims-audio"),
         pytest.param("anthropic_base64_media", Modality.MUSIC, id="anthropic-claims-music"),
+        pytest.param("audio_url_data_uri", Modality.IMAGE, id="audio-url-claims-image"),
     ],
 )
 def test_mode_rejects_incompatible_declared_capability(
@@ -646,6 +668,15 @@ class FailingCloseAsyncStream(httpx.AsyncByteStream):
     async def aclose(self) -> None:
         self.closed = True
         raise OSError("private-response-close-detail")
+
+
+class RequestFailingCloseAsyncStream(FailingCloseAsyncStream):
+    async def aclose(self) -> None:
+        self.closed = True
+        raise httpx.ReadError(
+            "private-response-close-detail",
+            request=httpx.Request("POST", "https://private.example.invalid"),
+        )
 
 
 class RejectIfIteratedStream(httpx.AsyncByteStream):
@@ -1028,12 +1059,14 @@ async def test_invalid_content_length_is_rejected_unread_and_closed(
 async def test_http_and_malformed_failures_use_stable_private_errors(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
     status: int,
     body: dict[str, object] | bytes,
     want_code: ErrorCode,
     want_retryable: bool,
 ) -> None:
     """Returning raw compatible-API errors would expose arbitrary Provider content."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0)
     media = tmp_path / "failure.jpg"
     media.write_bytes(b"private-media-marker")
     caplog.set_level(logging.DEBUG)
@@ -1064,14 +1097,19 @@ async def test_http_and_malformed_failures_use_stable_private_errors(
 @pytest.mark.asyncio
 async def test_transport_failures_are_sanitized(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     failure: BaseException,
     want_code: ErrorCode,
 ) -> None:
     """Chaining transport diagnostics could expose headers, URLs, or local paths."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0)
     media = tmp_path / "transport.jpg"
     media.write_bytes(b"image")
+    calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         raise failure
 
     async with _client(handler) as client:
@@ -1081,6 +1119,7 @@ async def test_transport_failures_are_sanitized(
             )
 
     assert caught.value.code is want_code
+    assert calls == (1 if isinstance(failure, RuntimeError) else 2)
     assert caught.value.cause is None
     assert "private-" not in str(caught.value)
 
@@ -1294,6 +1333,410 @@ async def test_borrowed_client_remains_open() -> None:
     await provider.aclose()
     assert borrowed.is_closed is False
     await borrowed.aclose()
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        pytest.param(408, b"request-timeout", id="408-text"),
+        pytest.param(
+            429,
+            {"error": {"code": "rate_limit_exceeded", "message": "private"}},
+            id="429-json",
+        ),
+        pytest.param(
+            500,
+            {"error": {"code": "internal_server_error", "message": "private"}},
+            id="500-json",
+        ),
+        pytest.param(502, b"bad-gateway", id="502-text"),
+        pytest.param(
+            503,
+            {"error": {"code": "internal_server_error", "message": "private"}},
+            id="503-json",
+        ),
+        pytest.param(504, b"gateway-timeout", id="504-text"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transient_status_retries_once_then_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    body: dict[str, object] | bytes,
+) -> None:
+    """One bounded retry must cover both text and ordinary JSON error responses."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0)
+    media = tmp_path / "retry.jpg"
+    media.write_bytes(b"media-bytes")
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            if isinstance(body, dict):
+                return httpx.Response(status, json=body)
+            return httpx.Response(status, content=body)
+        return httpx.Response(200, json=_chat_response(Modality.IMAGE))
+
+    async with _client(handler) as client:
+        result = await _provider(client, _config("image_url_data_uri")).sense(
+            _request(media, media_kind=MediaKind.IMAGE, mime_type="image/jpeg", modality=Modality.IMAGE)
+        )
+
+    assert calls["count"] == 2
+    assert result.observations[Modality.IMAGE].summary == "Direct evidence."
+
+
+@pytest.mark.asyncio
+async def test_transient_status_exhausts_one_retry_then_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent JSON 5xx must stop after one retry with a private error."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0)
+    media = tmp_path / "retry-fail.jpg"
+    media.write_bytes(b"media-bytes")
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(
+            503,
+            json={
+                "error": {
+                    "code": "internal_server_error",
+                    "message": "private-still-cold",
+                }
+            },
+        )
+
+    async with _client(handler) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(media, media_kind=MediaKind.IMAGE, mime_type="image/jpeg", modality=Modality.IMAGE)
+            )
+
+    assert calls["count"] == 2
+    assert caught.value.code is ErrorCode.PROVIDER_UNAVAILABLE
+    assert caught.value.retryable is True
+    assert "private-still-cold" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("error_code", "want_code"),
+    [
+        pytest.param("invalid_api_key", ErrorCode.PROVIDER_AUTH_FAILED, id="auth"),
+        pytest.param(
+            "content_filter",
+            ErrorCode.PROVIDER_SAFETY_REJECTED,
+            id="safety",
+        ),
+        pytest.param(
+            "unsupported_media_type",
+            ErrorCode.PROVIDER_CAPABILITY_REJECTED,
+            id="capability",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_json_error_on_transient_status_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    want_code: ErrorCode,
+) -> None:
+    """A contradictory 503 must not override an explicit terminal Provider error."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0)
+    media = tmp_path / "terminal.jpg"
+    media.write_bytes(b"media")
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, json={"error": {"code": error_code}})
+
+    async with _client(handler) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert calls == 1
+    assert caught.value.code is want_code
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_is_inside_the_overall_request_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short configured deadline must expire before a delayed second call starts."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0.05)
+    media = tmp_path / "deadline.jpg"
+    media.write_bytes(b"media")
+    calls = 0
+    config = _config("image_url_data_uri")
+    options = config.adapter_options.model_copy(
+        update={"request_timeout_seconds": 0.01}
+    )
+    config = config.model_copy(update={"adapter_options": options})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, content=b"private-cold-start")
+
+    async with _client(handler) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, config).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert calls == 1
+    assert caught.value.code is ErrorCode.PROVIDER_TIMEOUT
+    assert "private-cold-start" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_retry_backoff_starts_no_second_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller cancellation must interrupt backoff without resending private media."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 60)
+    media = tmp_path / "cancel-backoff.jpg"
+    media.write_bytes(b"media")
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, content=b"cold-start")
+
+    async with _client(handler) as client:
+        task = asyncio.create_task(
+            _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+        )
+        while calls == 0:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_response_close_request_error_does_not_repeat_paid_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A response already received must not be resent only because close failed."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0)
+    media = tmp_path / "close-request-error.jpg"
+    media.write_bytes(b"media")
+    calls = 0
+    streams: list[RequestFailingCloseAsyncStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        stream = RequestFailingCloseAsyncStream(
+            json.dumps(_chat_response(Modality.IMAGE)).encode("utf-8")
+        )
+        streams.append(stream)
+        return httpx.Response(200, stream=stream)
+
+    async with _client(handler) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("image_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.IMAGE,
+                    mime_type="image/jpeg",
+                    modality=Modality.IMAGE,
+                )
+            )
+
+    assert calls == 1
+    assert caught.value.code is ErrorCode.PROVIDER_UNAVAILABLE
+    assert all(stream.closed for stream in streams)
+    assert "private-" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_malformed_music_json_retries_once_with_correction_prompt(
+    tmp_path: Path,
+) -> None:
+    """A long music report may retry formatting once without extra transport attempts."""
+    media = tmp_path / "事件视界.MP3"
+    media.write_bytes(b"audio")
+    request_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_payloads.append(json.loads(request.content))
+        if len(request_payloads) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"observations":[{"modality":"music"'
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json=_chat_response(Modality.MUSIC))
+
+    async with _client(handler) as client:
+        result = await _provider(client, _config("audio_url_data_uri")).sense(
+            _request(
+                media,
+                media_kind=MediaKind.AUDIO,
+                mime_type="audio/mpeg",
+                modality=Modality.MUSIC,
+            )
+        )
+
+    assert len(request_payloads) == 2
+    first_prompt = request_payloads[0]["messages"][0]["content"][1]["text"]
+    retry_prompt = request_payloads[1]["messages"][0]["content"][1]["text"]
+    assert "FORMAT RETRY" not in first_prompt
+    assert "FORMAT RETRY" in retry_prompt
+    assert result.observations[Modality.MUSIC].summary == "Direct evidence."
+
+
+@pytest.mark.asyncio
+async def test_plain_string_lyrics_trigger_targeted_format_retry(
+    tmp_path: Path,
+) -> None:
+    """A rejected string array must retry with the exact missing object contract."""
+    media = tmp_path / "structured-lyrics.mp3"
+    media.write_bytes(b"audio")
+    request_payloads: list[dict[str, Any]] = []
+    invalid_report = {
+        "observations": [
+            {
+                **_observation(Modality.MUSIC),
+                "transcript": ["private lyric one", "private lyric two"],
+            }
+        ]
+    }
+    valid_report = {
+        "observations": [
+            {
+                **_observation(Modality.MUSIC),
+                "transcript": [
+                    {
+                        "start_seconds": 0,
+                        "end_seconds": 1,
+                        "text": "structured lyric",
+                    }
+                ],
+            }
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_payloads.append(json.loads(request.content))
+        report = invalid_report if len(request_payloads) == 1 else valid_report
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(report)}}
+                ]
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await _provider(client, _config("audio_url_data_uri")).sense(
+            _request(
+                media,
+                media_kind=MediaKind.AUDIO,
+                mime_type="audio/mpeg",
+                modality=Modality.MUSIC,
+            )
+        )
+
+    assert len(request_payloads) == 2
+    first_prompt = request_payloads[0]["messages"][0]["content"][1]["text"]
+    retry_prompt = request_payloads[1]["messages"][0]["content"][1]["text"]
+    assert "FORMAT RETRY" not in first_prompt
+    assert "FORMAT RETRY" in retry_prompt
+    assert "JSON object" in retry_prompt
+    assert "start_seconds" in retry_prompt
+    assert "Never output a plain string" in retry_prompt
+    observation = result.observations[Modality.MUSIC]
+    assert [item.text for item in observation.transcript] == ["structured lyric"]
+    assert observation.transcript[0].start_seconds == 0
+    assert observation.transcript[0].end_seconds == 1
+
+
+@pytest.mark.asyncio
+async def test_format_and_transport_retries_share_one_two_call_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient first call leaves no third paid call for format correction."""
+    monkeypatch.setattr(compatible_module, "_RETRY_BACKOFF_START", 0)
+    media = tmp_path / "bounded-budget.mp3"
+    media.write_bytes(b"audio")
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, content=b"cold-start")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"observations":[{"modality":"music"'
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with _client(handler) as client:
+        with pytest.raises(SensoryError) as caught:
+            await _provider(client, _config("audio_url_data_uri")).sense(
+                _request(
+                    media,
+                    media_kind=MediaKind.AUDIO,
+                    mime_type="audio/mpeg",
+                    modality=Modality.MUSIC,
+                )
+            )
+
+    assert calls == 2
+    assert caught.value.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
 
 
 class DelayedCloseClient:

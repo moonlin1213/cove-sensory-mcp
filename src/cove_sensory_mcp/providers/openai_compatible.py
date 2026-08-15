@@ -26,6 +26,17 @@ _DEFAULT_MAX_BYTES = 200 * 1024 * 1024
 _DEFAULT_MAX_OUTPUT_TOKENS = 4_096
 _DEFAULT_TEMPERATURE = 0.2
 _DEFAULT_TIMEOUT_SECONDS = 120.0
+_MAX_REQUEST_ATTEMPTS = 2
+_RETRY_BACKOFF_START = 0.5
+_TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+_FORMAT_RETRY_INSTRUCTION = (
+    "FORMAT RETRY: Your previous response was rejected. Every item in segments and "
+    "transcript MUST be a JSON object with exactly these fields: start_seconds (number), "
+    "end_seconds (number), and text (string). Never output a plain string as an item. "
+    "Return one complete JSON object matching the contract; no Markdown fences, no "
+    "commentary, no trailing text. If the output would be too long, shorten or omit "
+    "lower-priority detail instead of truncating."
+)
 _MAX_MODEL_LENGTH = 256
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_RESPONSE_BYTES_TEXT = str(_MAX_RESPONSE_BYTES)
@@ -51,6 +62,11 @@ class _FailureKind(str, Enum):
     TIMEOUT = "timeout"
     CAPABILITY = "capability"
     UNAVAILABLE = "unavailable"
+
+
+_TERMINAL_ERROR_KINDS = frozenset(
+    {_FailureKind.AUTH, _FailureKind.SAFETY, _FailureKind.CAPABILITY}
+)
 
 
 class _ResponseReadRejected(Exception):
@@ -133,6 +149,18 @@ def _build_image_url_data_uri(
     }
 
 
+def _build_audio_url_data_uri(
+    encoded_media: str,
+    mime_type: str,
+    media_kind: MediaKind,
+) -> dict[str, object]:
+    del media_kind
+    return {
+        "type": "audio_url",
+        "audio_url": {"url": f"data:{mime_type};base64,{encoded_media}"},
+    }
+
+
 def _build_input_audio_base64(
     encoded_media: str,
     mime_type: str,
@@ -180,6 +208,7 @@ _MEDIA_BUILDERS = {
     "input_audio_base64": _build_input_audio_base64,
     "video_url_data_uri": _build_video_url_data_uri,
     "anthropic_base64_media": _build_anthropic_base64_media,
+    "audio_url_data_uri": _build_audio_url_data_uri,
 }
 
 _MODE_CAPABILITIES = {
@@ -192,6 +221,9 @@ _MODE_CAPABILITIES = {
     ),
     "anthropic_base64_media": frozenset(
         {Modality.IMAGE, Modality.VIDEO_VISUAL}
+    ),
+    "audio_url_data_uri": frozenset(
+        {Modality.VIDEO_AUDIO, Modality.AUDIO, Modality.MUSIC}
     ),
 }
 
@@ -223,6 +255,8 @@ def _request_is_compatible(
         return request.media.media_kind is MediaKind.AUDIO and mime_kind == "audio"
     if mode == "video_url_data_uri":
         return request.media.media_kind is MediaKind.VIDEO and mime_kind == "video"
+    if mode == "audio_url_data_uri":
+        return request.media.media_kind is MediaKind.AUDIO and mime_kind == "audio"
     if request.media.media_kind is MediaKind.IMAGE:
         return modality is Modality.IMAGE and mime_kind == "image"
     return (
@@ -419,7 +453,7 @@ def _extract_response_text(payload: dict[str, Any]) -> str:
 
 
 class OpenAICompatibleProvider:
-    """Send one prepared file through one of four explicit compatible wire shapes."""
+    """Send one prepared file through one of five explicit compatible wire shapes."""
 
     def __init__(
         self,
@@ -550,6 +584,7 @@ class OpenAICompatibleProvider:
             request.media.media_kind,
         )
         encoded_media = ""
+        text_part = {"type": "text", "text": prompt}
         payload: dict[str, object] = {
             "model": self._config.model,
             "max_tokens": (
@@ -564,99 +599,157 @@ class OpenAICompatibleProvider:
             "messages": [
                 {
                     "role": "user",
-                    "content": [media_part, {"type": "text", "text": prompt}],
+                    "content": [media_part, text_part],
                 }
             ],
         }
         media_part = {}
         credential = self._credential()
-        headers = self._headers(credential)
-        credential = ""
-        response_status: int | None = None
-        response_success = False
-        response_body = b""
+        backoff = _RETRY_BACKOFF_START
         try:
-            response_context = self._client.stream(
-                "POST",
-                self._endpoint,
-                headers=headers,
-                json=payload,
-                timeout=self._timeout(),
-                follow_redirects=False,
-            )
-            response = await response_context.__aenter__()
-            primary_failure: BaseException | None = None
-            try:
-                response_status = response.status_code
-                response_success = response.is_success
-                if response.is_redirect:
-                    raise _public_error(_FailureKind.UNAVAILABLE)
-                try:
-                    response_body = await _read_bounded_response(response)
-                except _ResponseReadRejected:
-                    if response_success:
-                        raise _response_error() from None
-                    raise _public_error(_FailureKind.UNAVAILABLE) from None
-            except BaseException as exc:  # noqa: BLE001 - re-raised after close
-                primary_failure = exc
-            close_failure, close_interrupted = await _close_response_context(
-                response_context
-            )
-            if isinstance(primary_failure, asyncio.CancelledError):
-                raise primary_failure
-            if close_interrupted:
-                raise asyncio.CancelledError
-            if primary_failure is not None:
-                raise primary_failure
-            if close_failure is not None:
-                raise close_failure
+            async with asyncio.timeout(self._timeout()):
+                for attempt in range(_MAX_REQUEST_ATTEMPTS):
+                    response_status: int | None = None
+                    response_success = False
+                    response_body = b""
+                    response_payload: dict[str, Any] | None = None
+                    response_received = False
+                    headers = self._headers(credential)
+                    try:
+                        response_context = self._client.stream(
+                            "POST",
+                            self._endpoint,
+                            headers=headers,
+                            json=payload,
+                            timeout=self._timeout(),
+                            follow_redirects=False,
+                        )
+                        try:
+                            response = await response_context.__aenter__()
+                            response_received = True
+                            primary_failure: BaseException | None = None
+                            try:
+                                response_status = response.status_code
+                                response_success = response.is_success
+                                if response.is_redirect:
+                                    raise _public_error(_FailureKind.UNAVAILABLE)
+                                try:
+                                    response_body = await _read_bounded_response(response)
+                                except _ResponseReadRejected:
+                                    if response_success:
+                                        raise _response_error() from None
+                                    raise _public_error(
+                                        _FailureKind.UNAVAILABLE
+                                    ) from None
+                            except BaseException as exc:  # noqa: BLE001
+                                primary_failure = exc
+                            close_failure, close_interrupted = (
+                                await _close_response_context(response_context)
+                            )
+                            if isinstance(primary_failure, asyncio.CancelledError):
+                                raise primary_failure
+                            if close_interrupted:
+                                raise asyncio.CancelledError
+                            if primary_failure is not None:
+                                raise primary_failure
+                            if close_failure is not None:
+                                if isinstance(close_failure, httpx.TimeoutException):
+                                    raise _public_error(_FailureKind.TIMEOUT)
+                                raise _public_error(_FailureKind.UNAVAILABLE)
+                        except asyncio.CancelledError:
+                            raise
+                        except SensoryError:
+                            raise
+                        except httpx.TimeoutException:
+                            if response_received:
+                                raise _public_error(_FailureKind.TIMEOUT) from None
+                            if attempt + 1 < _MAX_REQUEST_ATTEMPTS:
+                                await asyncio.sleep(backoff)
+                                continue
+                            raise _public_error(_FailureKind.TIMEOUT) from None
+                        except httpx.RequestError:
+                            if response_received:
+                                raise _public_error(_FailureKind.UNAVAILABLE) from None
+                            if attempt + 1 < _MAX_REQUEST_ATTEMPTS:
+                                await asyncio.sleep(backoff)
+                                continue
+                            raise _public_error(_FailureKind.UNAVAILABLE) from None
+                        except Exception:  # noqa: BLE001
+                            raise _public_error(_FailureKind.UNAVAILABLE) from None
+                    finally:
+                        headers.clear()
+
+                    if response_status is None:
+                        raise _public_error(_FailureKind.UNAVAILABLE)
+                    response_payload = _decode_payload(response_body)
+                    response_body = b""
+                    error_present = False
+                    error_kind: _FailureKind | None = None
+                    if response_payload is not None:
+                        error_present, error_kind = _error_envelope_kind(
+                            response_payload
+                        )
+                        if error_present and error_kind in _TERMINAL_ERROR_KINDS:
+                            raise _public_error(error_kind)
+                    if not response_success:
+                        if (
+                            response_status in _TRANSIENT_STATUS_CODES
+                            and attempt + 1 < _MAX_REQUEST_ATTEMPTS
+                        ):
+                            if response_payload is not None:
+                                response_payload.clear()
+                            await asyncio.sleep(backoff)
+                            continue
+                        if error_present and error_kind is not None:
+                            raise _public_error(error_kind)
+                        raise _public_error(_classify_response(response_status))
+                    if error_present:
+                        if error_kind is not None:
+                            raise _public_error(error_kind)
+                        raise _response_error()
+                    if response_payload is None:
+                        raise _response_error()
+                    response_text = _extract_response_text(response_payload)
+                    response_payload.clear()
+                    try:
+                        batch = normalize_provider_text(
+                            response_text,
+                            expected_modalities=request.requested_modalities,
+                            duration_seconds=request.media.duration_seconds,
+                        )
+                    except SensoryError as exc:
+                        if (
+                            exc.code is ErrorCode.PROVIDER_CAPABILITY_REJECTED
+                            and attempt + 1 < _MAX_REQUEST_ATTEMPTS
+                        ):
+                            response_text = ""
+                            text_part["text"] = (
+                                f"{prompt}\n{_FORMAT_RETRY_INSTRUCTION}"
+                            )
+                            continue
+                        response_text = ""
+                        raise
+                    response_text = ""
+                    return ProviderCallResult(
+                        observations=batch.by_modality(),
+                        provider_id=self._provider_id,
+                        model=self._config.model,
+                        remote_file_deleted=None,
+                    )
+        except TimeoutError:
+            raise _public_error(_FailureKind.TIMEOUT) from None
         except asyncio.CancelledError:
             raise
         except SensoryError:
             raise
-        except httpx.TimeoutException:
-            raise _public_error(_FailureKind.TIMEOUT) from None
-        except httpx.RequestError:
-            raise _public_error(_FailureKind.UNAVAILABLE) from None
-        except Exception:  # noqa: BLE001 - privacy boundary discards transport internals
+        except Exception:  # noqa: BLE001 - privacy boundary discards internals
             raise _public_error(_FailureKind.UNAVAILABLE) from None
         finally:
-            headers.clear()
+            credential = ""
             payload.clear()
+            text_part.clear()
             prompt = ""
-
-        if response_status is None:
-            raise _public_error(_FailureKind.UNAVAILABLE)
-        response_payload = _decode_payload(response_body)
-        response_body = b""
-        if response_payload is not None:
-            error_present, error_kind = _error_envelope_kind(response_payload)
-            if error_present:
-                if error_kind is not None:
-                    raise _public_error(error_kind)
-                if response_success:
-                    raise _response_error()
-                raise _public_error(_classify_response(response_status))
-        if not response_success:
-            raise _public_error(_classify_response(response_status))
-        if response_payload is None:
-            raise _response_error()
-        response_text = _extract_response_text(response_payload)
-        try:
-            batch = normalize_provider_text(
-                response_text,
-                expected_modalities=request.requested_modalities,
-                duration_seconds=request.media.duration_seconds,
-            )
-        except RecursionError:
-            raise _response_error() from None
-        response_text = ""
-        return ProviderCallResult(
-            observations=batch.by_modality(),
-            provider_id=self._provider_id,
-            model=self._config.model,
-            remote_file_deleted=None,
-        )
+        raise _public_error(_FailureKind.UNAVAILABLE)
 
     async def aclose(self) -> None:
         """Close only a client created and owned by this adapter."""

@@ -43,6 +43,11 @@ stores only the variable name. Add each readable local directory separately with
   music.
 - MiniMax-M3 can be an image/native-video eye; it is not treated as an ear, so choose a
   separate audio provider for a video's soundtrack.
+- An OpenAI-compatible provider using the `audio_url_data_uri` media mode can serve as
+  the ear on platforms that accept an `audio_url` content part (for example SiliconFlow's
+  Qwen3-Omni-Instruct), covering audio, music, and video audio. One bounded retry covers
+  transient 408, 429, 500, 502, 503, and 504 responses, connection/timeout failures, or
+  malformed structured output, and may incur one additional Provider call or charge.
 - A custom provider must declare capabilities and pass the tiny-media self-test before
   those capabilities are advertised. The self-test sends project-created media, can
   incur a small API cost, and requires confirmation. It verifies that the Provider call

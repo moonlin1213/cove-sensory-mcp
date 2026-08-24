@@ -32,6 +32,25 @@ Run later commands from the cloned repository with `uv run cove-sensory-mcp ...`
 FFmpeg is optional for initial setup and image sensing, but video/audio preparation
 requires a working system FFmpeg discoverable on `PATH` or configured locally.
 
+### Linux
+
+Linux is supported from source. Install Git and FFmpeg with the distribution package
+manager, then follow the locked `uv sync` workflow above. For example, on Ubuntu or
+Debian:
+
+```console
+sudo apt update
+sudo apt install -y git ffmpeg
+```
+
+Configuration follows the XDG Base Directory convention. When the variables are not
+set, the defaults are `~/.config/cove-sensory-mcp/config.yaml` for persistent config
+and `~/.cache/cove-sensory-mcp/jobs` for transient media jobs. A desktop keyring may
+store Provider credentials. On a headless Linux host without a keyring backend, choose
+an `env:VARIABLE_NAME` credential reference and make that variable available to the MCP
+client process. The repository directory and its `.venv` must remain available because
+the MCP client launches `.venv/bin/cove-sensory-mcp` directly.
+
 Do not paste an API key into chat. Run `cove-sensory-mcp configure` in a local terminal:
 hidden input goes to the operating-system credential store, while `env:VARIABLE_NAME`
 stores only the variable name. Add each readable local directory separately with

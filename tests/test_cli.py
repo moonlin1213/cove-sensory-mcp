@@ -455,6 +455,47 @@ def test_status_command_composes_services_only_after_dispatch(
     assert "Configuration: readable" in capsys.readouterr().out
 
 
+def test_linux_status_reads_configuration_from_xdg_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The real CLI entrypoint must honor Linux's persistent config location."""
+    config_home = tmp_path / "config"
+    cache_home = tmp_path / "cache"
+    config_file = config_home / "cove-sensory-mcp/config.yaml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("providers: [invalid\n", encoding="utf-8")
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    monkeypatch.setattr(cli, "KeyringSecretStore", MemorySecretStore)
+
+    assert main(["status"]) == 1
+    assert "Configuration: invalid" in capsys.readouterr().out
+
+
+def test_linux_status_ignores_relative_xdg_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A relative XDG value must not make config resolution depend on the CWD."""
+    home = tmp_path / "home"
+    config_file = home / ".config/cove-sensory-mcp/config.yaml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("providers: [invalid\n", encoding="utf-8")
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative-config")
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative-cache")
+    monkeypatch.setattr(cli, "KeyringSecretStore", MemorySecretStore)
+
+    assert main(["status"]) == 1
+    assert "Configuration: invalid" in capsys.readouterr().out
+
+
 def test_installed_metadata_pins_sdk_used_by_version_entrypoint() -> None:
     """A broad MCP requirement can install an SDK that cannot import the CLI server API."""
     project_requirements = requires("cove-sensory-mcp") or []

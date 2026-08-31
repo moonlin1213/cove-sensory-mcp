@@ -70,6 +70,8 @@ def _build_services() -> AppServices:
         home=Path.home(),
         roaming=_optional_environment_path("APPDATA"),
         local=_optional_environment_path("LOCALAPPDATA"),
+        xdg_config=_optional_environment_path("XDG_CONFIG_HOME"),
+        xdg_cache=_optional_environment_path("XDG_CACHE_HOME"),
     )
     return AppServices(
         config_store=ConfigStore(paths.config_file, jobs_dir=paths.jobs_dir),

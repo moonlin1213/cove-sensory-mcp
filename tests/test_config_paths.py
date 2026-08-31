@@ -27,6 +27,54 @@ def test_windows_paths_use_roaming_and_local(tmp_path: Path) -> None:
     assert paths.jobs_dir == local / "CoveSensoryMCP/Cache/jobs"
 
 
+def test_linux_paths_use_xdg_directories(tmp_path: Path) -> None:
+    """Linux users may relocate persistent config and transient cache independently."""
+    config_home = tmp_path / "xdg-config"
+    cache_home = tmp_path / "xdg-cache"
+
+    paths = AppPaths.for_system(
+        "Linux",
+        home=tmp_path,
+        roaming=None,
+        local=None,
+        xdg_config=config_home,
+        xdg_cache=cache_home,
+    )
+
+    assert paths.config_file == config_home / "cove-sensory-mcp/config.yaml"
+    assert paths.jobs_dir == cache_home / "cove-sensory-mcp/jobs"
+
+
+def test_linux_paths_fall_back_to_home_when_xdg_is_unset(tmp_path: Path) -> None:
+    """A minimal Linux environment must work without optional XDG variables."""
+    paths = AppPaths.for_system(
+        "Linux",
+        home=tmp_path,
+        roaming=None,
+        local=None,
+        xdg_config=None,
+        xdg_cache=None,
+    )
+
+    assert paths.config_file == tmp_path / ".config/cove-sensory-mcp/config.yaml"
+    assert paths.jobs_dir == tmp_path / ".cache/cove-sensory-mcp/jobs"
+
+
+def test_linux_paths_ignore_relative_xdg_directories(tmp_path: Path) -> None:
+    """Relative XDG roots must not make storage depend on the process CWD."""
+    paths = AppPaths.for_system(
+        "Linux",
+        home=tmp_path,
+        roaming=None,
+        local=None,
+        xdg_config=Path("relative-config"),
+        xdg_cache=Path("relative-cache"),
+    )
+
+    assert paths.config_file == tmp_path / ".config/cove-sensory-mcp/config.yaml"
+    assert paths.jobs_dir == tmp_path / ".cache/cove-sensory-mcp/jobs"
+
+
 def test_unsupported_platform_reports_a_public_configuration_error(tmp_path: Path) -> None:
     """Changing the fallback branch must not permit an unsupported platform."""
     with pytest.raises(SensoryError) as exc_info:

@@ -168,8 +168,8 @@ async def test_invalid_self_test_modalities_return_only_a_bounded_public_error(
 
 
 @pytest.mark.skipif(
-    platform.system() not in {"Darwin", "Windows"},
-    reason="The local MCP server supports macOS and Windows.",
+    platform.system() not in {"Darwin", "Linux", "Windows"},
+    reason="The local MCP server supports macOS, Linux, and Windows.",
 )
 def test_serve_stdout_contains_only_mcp_json(tmp_path) -> None:
     """A plain-text diagnostic on stdout would corrupt the line-framed MCP transport."""
